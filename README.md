@@ -36,12 +36,11 @@ With a QooCam 3 Ultra modified for VR180 (lenses side by side), it can also **im
    ```
    adb install VR180Viewer.apk
    ```
-3. Grant **All files access**, so the viewer can read your photos. The simplest way is with adb:
+3. Start the viewer (in your app library under **Unknown Sources**). The first time, it asks for **All files access**, so it can read your photos: choose **Open settings**, allow it, then close the Settings window to return to the viewer.
+   If the viewer doesn't respond after that, quit and restart it. Alternatively, grant the permission from a PC with adb:
    ```
    adb shell appops set --uid com.grahamwell.vr180viewer MANAGE_EXTERNAL_STORAGE allow
    ```
-   If no photos are found, the picker opens with an "Open settings" button and these instructions; the adb route is more reliable.
-4. In the headset, the app is listed under **Unknown Sources** in your app library.
 
 ## Where to put your photos
 
