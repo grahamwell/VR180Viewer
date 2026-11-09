@@ -175,7 +175,7 @@ public class VR180FlatExport : MonoBehaviour
         float t0 = Time.realtimeSinceStartup;
 
         // Full-resolution photo, decoded off the main thread
-        Texture2D src;
+        Texture src;
         using (var req = UnityWebRequestTexture.GetTexture(new Uri(source).AbsoluteUri, true))
         {
             yield return req.SendWebRequest();
@@ -184,7 +184,7 @@ public class VR180FlatExport : MonoBehaviour
                 Fail($"couldn't read {Path.GetFileName(source)}: {req.error}");
                 yield break;
             }
-            src = DownloadHandlerTexture.GetContent(req);
+            src = VR180Fisheye.ConvertIfRaw(DownloadHandlerTexture.GetContent(req), source);   // raw QooCam photos
         }
 
         // Size the picture so its centre has about one output pixel per source pixel

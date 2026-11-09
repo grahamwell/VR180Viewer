@@ -119,6 +119,10 @@ public class VR180Viewer : MonoBehaviour
     [Tooltip("Tick if exported flat pictures come out upside down.")]
     public bool flipFlatExport = false;
 
+    [Tooltip("Unprocessed QooCam photos (two fisheye circles, imported from the camera) are converted when shown. " +
+             "Tick to level their horizon from the camera's gravity reading, as QooCam Studio does.")]
+    public bool levelFisheyePhotos = true;
+
     [Tooltip("How much the photo behind the picker is softened, from 0 (not at all) to 1 (its average colour).")]
     [Range(0f, 1f)]
     public float pickerBackdropBlur = 0.3f;
@@ -143,6 +147,7 @@ public class VR180Viewer : MonoBehaviour
     static readonly int MainTexId      = Shader.PropertyToID("_MainTex");
     static readonly int CoverageId     = Shader.PropertyToID("_Coverage");
     static readonly int StereoId       = Shader.PropertyToID("_StereoSBS");
+    static readonly int FisheyeId      = Shader.PropertyToID("_Fisheye");
     static readonly int MaxMipId       = Shader.PropertyToID("_MaxMip");
     static readonly int FadeId         = Shader.PropertyToID("_Fade");
     static readonly int WorldToImageId = Shader.PropertyToID("_WorldToImage");
@@ -165,6 +170,9 @@ public class VR180Viewer : MonoBehaviour
     int photoGeneration;   // bumped on every photo change, so stale coroutines can tell
     bool busy;
     Transform head;
+    VR180Notice notice;
+    readonly HashSet<string> camerasWarned = new HashSet<string>();   // uncalibrated cameras already mentioned this session
+    const float CalibrationNoticeSeconds = 9f;
     RenderTexture current;
     RenderTexture holdTex;   // 1x1: the previous photo's average colour, shown while the next loads
     PhotoInfo currentInfo;
@@ -210,12 +218,17 @@ public class VR180Viewer : MonoBehaviour
     {
         public Vector4 coverage;   // lonMin, lonMax, latMin, latMax in radians
         public bool sideBySide;
+        public bool fisheye;            // an unprocessed QooCam photo, converted as it's used
+        public VR180Fisheye.Raw raw;
     }
 
     // ------------------------------------------------------------------ lifecycle
 
+    void OnValidate() => VR180Fisheye.Levelling = levelFisheyePhotos;
+
     void Awake()
     {
+        VR180Fisheye.Levelling = levelFisheyePhotos;
         // On PC the layer can't show stereo VR180 (see Layer On PC), so leave it out entirely
         if (!OnQuest && !layerOnPC && photoLayer != null)
         {
@@ -377,6 +390,8 @@ public class VR180Viewer : MonoBehaviour
         loading.Init(head);
         badge = gameObject.AddComponent<VR180FavouriteBadge>();
         badge.Init(head);
+        notice = gameObject.AddComponent<VR180Notice>();
+        notice.Init(head);
 
         Debug.Log($"VR180Viewer: running on {(OnQuest ? "the Quest" : "PC")}; max texture size on this device is {SystemInfo.maxTextureSize}, " +
                   $"system memory {SystemInfo.systemMemorySize} MB, graphics memory {SystemInfo.graphicsMemorySize} MB");
@@ -389,6 +404,12 @@ public class VR180Viewer : MonoBehaviour
             ? questFlatFolder
             : Path.Combine(Path.GetDirectoryName(Path.GetFullPath(pcFolder).TrimEnd('\\', '/')) ?? pcFolder, "VR180 Flat");
         VR180PhotoPicker.ExcludedFolder = flatFolder;   // flat pictures aren't VR180, so keep them out of the picker
+
+        // Camera calibration files (QooCam Studio's <serial>_refined.xml) for raw fisheye photos.
+        // Created empty so it's easy to find over USB; the picker doesn't list it.
+        VR180Fisheye.CalibrationFolder = Path.Combine(PhotoRoot, VR180Fisheye.CalibrationFolderName);
+        try { Directory.CreateDirectory(VR180Fisheye.CalibrationFolder); }
+        catch (Exception e) { Debug.Log($"VR180Viewer: couldn't create {VR180Fisheye.CalibrationFolder} yet: {e.Message}"); }
         flatExport = gameObject.AddComponent<VR180FlatExport>();
         flatExport.Init(this, flatFolder);
 
@@ -843,13 +864,19 @@ public class VR180Viewer : MonoBehaviour
                 yield break;
             }
             Texture2D src = DownloadHandlerTexture.GetContent(req);
+            if (currentInfo.fisheye && src.width != src.height * 2)
+            {
+                Debug.LogWarning($"VR180Viewer: {Path.GetFileName(path)} looks like a raw fisheye photo but is {src.width}x{src.height}; showing it as it is");
+                currentInfo.fisheye = false;
+            }
 
             // Layer textures first, straight from the full-size decoded photo
             bool layerWanted = photoLayer != null && layerTextures != null && extractMaterial != null;
             if (layerWanted) BuildLayerTextures(src);
 
             // The sphere's copy can be much smaller when the layer is showing the photo
-            current = MakeMipmapped(src, layerWanted ? sphereHalvingsWithLayer : 0);
+            // (An unprocessed QooCam photo is converted on the way into both: no full-size converted copy)
+            current = MakeMipmapped(src, layerWanted ? sphereHalvingsWithLayer : 0, currentInfo.fisheye, currentInfo.raw);
             Destroy(src);
         }
         yield return null;   // let the decoded photo's memory be freed before the layer starts up
@@ -879,6 +906,15 @@ public class VR180Viewer : MonoBehaviour
         {
             yield return Fade(1f);
         }
+        // A raw photo from a camera without its calibration file: say so (once per camera per
+        // session) before the layer appears, since the layer would cover the message
+        if (currentInfo.fisheye && currentInfo.raw.calibrationProblem != null && notice != null &&
+            camerasWarned.Add(currentInfo.raw.serial ?? ""))
+        {
+            notice.Show("Camera not calibrated", currentInfo.raw.calibrationProblem, CalibrationNoticeSeconds);
+            while (notice.Visible) yield return null;
+        }
+
         if (useLayer) ShowLayer();
         busy = false;
     }
@@ -903,7 +939,7 @@ public class VR180Viewer : MonoBehaviour
         return temp;
     }
 
-    static RenderTexture MakeMipmapped(Texture src, int halvings)
+    static RenderTexture MakeMipmapped(Texture src, int halvings, bool fisheye = false, VR180Fisheye.Raw raw = default)
     {
         RenderTexture temp = HalveTemp(src, halvings);
         Texture from = temp != null ? temp : src;
@@ -918,7 +954,9 @@ public class VR180Viewer : MonoBehaviour
             anisoLevel = 8
         };
         rt.Create();
-        Graphics.Blit(from, rt);
+        Material convert = fisheye ? VR180Fisheye.ConversionMaterial(raw, from.width) : null;
+        if (convert != null) Graphics.Blit(from, rt, convert);   // halved fisheye -> equirect at this size
+        else Graphics.Blit(from, rt);
         rt.GenerateMips();
         if (temp != null) RenderTexture.ReleaseTemporary(temp);
         return rt;
@@ -946,6 +984,8 @@ public class VR180Viewer : MonoBehaviour
 
         extractMaterial.SetVector(CoverageId, currentInfo.coverage);
         extractMaterial.SetFloat(StereoId, currentInfo.sideBySide ? 1f : 0f);
+        extractMaterial.SetFloat(FisheyeId, currentInfo.fisheye ? 1f : 0f);
+        if (currentInfo.fisheye) VR180Fisheye.SetParams(extractMaterial, currentInfo.raw, src.width);
         extractMaterial.SetFloat(EdgeFeatherId, viewerMaterial.GetFloat(EdgeFeatherId));
         extractMaterial.SetFloat(FlipYId, flipLayerVertically ? 1f : 0f);
         extractMaterial.SetFloat(ForceOpaqueId, forceOpaqueLayer ? 1f : 0f);
@@ -1242,6 +1282,14 @@ public class VR180Viewer : MonoBehaviour
             float latMax = H - top / fullH * Mathf.PI;
             float latMin = H - (top + cropH) / fullH * Mathf.PI;
             info.coverage = new Vector4(lonMin, lonMax, latMin, latMax);
+        }
+
+        // An unprocessed QooCam photo (two fisheye circles): always 180 x 180 side-by-side once converted
+        if (VR180Fisheye.TryGetRaw(path, out info.raw))
+        {
+            info.fisheye = true;
+            info.sideBySide = true;
+            info.coverage = new Vector4(-H, H, -H, H);
         }
         return info;
     }

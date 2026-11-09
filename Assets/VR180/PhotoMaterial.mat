@@ -48,7 +48,7 @@ Material:
     - _HoldMix: 0
     - _LayerMode: 0
     - _MaxMip: 13
-    - _MipBias: -0.73785096
+    - _MipBias: -0.80945504
     - _Saturation: 1
     - _StereoSBS: 1
     m_Colors:

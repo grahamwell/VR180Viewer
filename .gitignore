@@ -18,6 +18,8 @@
 *_BackUpThisFolder_ButDontShipItWithYourGame/
 
 # Personal working folders inside Assets
+/Assets/_Recovery/
+/Assets/_Recovery.meta
 /Assets/Claude/
 /Assets/Claude.meta
 /Assets/Zips/

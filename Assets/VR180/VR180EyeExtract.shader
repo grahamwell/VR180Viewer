@@ -3,6 +3,8 @@
 // fades the photo out over the edge feather, matching VR180/StereoEquirect, so
 // the sharp layer melts into the soft surround drawn underneath it.
 // The photo's brightness/contrast/saturation adjustments are baked in here too.
+// Fisheye mode (_Fisheye = 1): the source is an unprocessed QooCam photo (two fisheye circles),
+// and each eye is converted straight from it (VR180Fisheye.hlsl), with no full-size copy between.
 
 Shader "Hidden/VR180/EyeExtract"
 {
@@ -30,6 +32,9 @@ Shader "Hidden/VR180/EyeExtract"
 
             TEXTURE2D(_MainTex);
             SAMPLER(sampler_MainTex);
+            float4 _MainTex_TexelSize;
+            #include "Assets/VR180/VR180Fisheye.hlsl"
+            float _Fisheye;        // 1 = source is a raw dual-fisheye photo
 
             float4 _Coverage;      // lonMin, lonMax, latMin, latMax (radians)
             float _Eye;            // 0 = left, 1 = right
@@ -75,9 +80,17 @@ Shader "Hidden/VR180/EyeExtract"
                 float alpha = smoothstep(0.0, 1.0, saturate(degrees(max(inside, 0.0)) / max(_EdgeFeather, 0.01)));
 
                 // Colour: this eye's half of the image, one source pixel per output pixel
-                float2 tex = img;
-                if (_StereoSBS > 0.5) tex.x = (img.x + _Eye) * 0.5;
-                float3 col = SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, tex, 0).rgb;
+                float3 col;
+                if (_Fisheye > 0.5)
+                {
+                    col = FisheyeColour(lon, lat, _Eye > 0.5);
+                }
+                else
+                {
+                    float2 tex = img;
+                    if (_StereoSBS > 0.5) tex.x = (img.x + _Eye) * 0.5;
+                    col = SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, tex, 0).rgb;
+                }
 
                 // Picture adjustments, the same as VR180/StereoEquirect applies
                 col *= exp2(_Exposure);

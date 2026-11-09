@@ -10,6 +10,10 @@
 // On Android it also checks for "All files access" (MANAGE_EXTERNAL_STORAGE), which is needed
 // to read shared folders such as Pictures. If it's missing, the panel offers to open the
 // Quest's settings page for this app, and shows the adb command that grants it from a PC.
+//
+// On the Quest, the top level also offers "Import from camera": copies JPEGs from a camera plugged
+// into the USB-C port (MTP, via VR180CameraImport and Plugins/Android/CameraImport.java) into
+// Pictures/QooCam Import, skipping ones already there.
 
 using System;
 using System.Collections.Generic;
@@ -130,6 +134,7 @@ public class VR180PhotoPicker : MonoBehaviour
         catch (Exception e) { Debug.LogWarning($"VR180Viewer [picker]: can't create {root}: {e.Message}"); }
 
         if (copying) { ShowCopyProgress(); return; }
+        if (importStage != ImportStage.None) { ShowImport(); return; }
         if (tidyList != null) { ShowTidyConfirmation(); return; }
         if (copyList != null) { ShowCopyConfirmation(); return; }
 
@@ -145,6 +150,14 @@ public class VR180PhotoPicker : MonoBehaviour
         }
 
         var entries = new List<(string label, Action action, bool highlight, string detail)>();
+        if (VR180Viewer.OnQuest && SamePath(folder, root))
+        {
+            string cam = VR180CameraImport.FindCamera();
+            cameraShown = cam != null;
+            entries.Add((cam != null ? "Import from camera" : "Import from camera: not connected",
+                         () => { if (importStage == ImportStage.None) StartCoroutine(ScanCamera()); }, false,
+                         cam ?? "plug the camera into the Quest's USB-C port and switch it on"));
+        }
         if (!SamePath(folder, root))
             entries.Add(("< Up one level", () => Navigate(Path.GetDirectoryName(folder)), false, null));
 
@@ -326,6 +339,141 @@ public class VR180PhotoPicker : MonoBehaviour
         Refresh();
     }
 
+    // ------------------------------------------------------------------ import from camera (Quest only)
+
+    enum ImportStage { None, Permission, Scanning, Choice, Importing }
+    ImportStage importStage;
+    string importCamera;
+    const int TestImportCount = 5;
+    string ImportFolder => Path.Combine(root, "QooCam Import");
+
+    void ShowImport()
+    {
+        titleText.text = "Import from camera";
+        switch (importStage)
+        {
+            case ImportStage.Permission:
+                statusText.text = $"Allow this app to use {importCamera} in the dialog Android shows " +
+                                  "(it may appear as a separate window).";
+                AddRow("Cancel", CancelImport);
+                break;
+
+            case ImportStage.Scanning:
+                statusText.text = $"Looking at the photos on {importCamera}...";
+                break;
+
+            case ImportStage.Choice:
+                int all = VR180CameraImport.PhotoCount, n = VR180CameraImport.NewCount;
+                statusText.text = $"{importCamera}: {all} photo{(all == 1 ? "" : "s")} ({SizeText(VR180CameraImport.PhotoBytes)}), " +
+                                  $"{n} not yet imported ({SizeText(VR180CameraImport.NewBytes)}).\n" +
+                                  $"They go into {DisplayPath(ImportFolder)}, and are converted from the camera's " +
+                                  "fisheye format each time they're shown (the originals aren't changed).";
+                if (n > TestImportCount)
+                    AddRow($"Import the newest {TestImportCount} (test)", () => StartImport(TestImportCount), true);
+                if (n > 0)
+                    AddRow($"Import all {n} new photo{(n == 1 ? "" : "s")}", () => StartImport(n), n <= TestImportCount);
+                AddRow(n > 0 ? "Cancel" : "Back", CancelImport);
+                break;
+
+            case ImportStage.Importing:
+                statusText.text = ImportProgress();
+                break;
+        }
+    }
+
+    // The camera may be plugged in or unplugged while the picker is open: keep the
+    // "Import from camera" row up to date (checked once a second, top level only)
+    float nextCameraCheck;
+    bool cameraShown;
+
+    void Update()
+    {
+        if (!VR180Viewer.OnQuest || !IsOpen || importStage != ImportStage.None || copying ||
+            tidyList != null || copyList != null || folder == null || !SamePath(folder, root)) return;
+        if (Time.unscaledTime < nextCameraCheck) return;
+        nextCameraCheck = Time.unscaledTime + 1f;
+        bool present = VR180CameraImport.FindCamera() != null;
+        if (present != cameraShown) Refresh();
+    }
+
+    static string ImportProgress() => $"Imported {VR180CameraImport.Done} of {VR180CameraImport.Total}...";
+
+    // Finds the camera, gets USB permission if needed, then lists its photos
+    IEnumerator ScanCamera()
+    {
+        importCamera = VR180CameraImport.FindCamera();
+        if (importCamera == null)
+        {
+            notice = "No camera found. Plug it into the Quest's USB-C port, switch it on, and try again.";
+            Refresh();
+            yield break;
+        }
+
+        if (!VR180CameraImport.HasPermission())
+        {
+            importStage = ImportStage.Permission;
+            Refresh();
+            VR180CameraImport.RequestPermission();
+            float start = Time.realtimeSinceStartup;
+            while (!VR180CameraImport.HasPermission())
+            {
+                if (importStage != ImportStage.Permission) yield break;   // cancelled
+                if (Time.realtimeSinceStartup - start > 120f) { EndImport("No permission to use the camera was given."); yield break; }
+                yield return new WaitForSecondsRealtime(0.25f);
+            }
+            Debug.Log("VR180Viewer [import]: USB permission granted");
+        }
+
+        importStage = ImportStage.Scanning;
+        Refresh();
+        VR180CameraImport.StartScan(ImportFolder);
+        float t0 = Time.realtimeSinceStartup;
+        while (VR180CameraImport.State == VR180CameraImport.Scanning)
+            yield return new WaitForSecondsRealtime(0.1f);
+        if (VR180CameraImport.State != VR180CameraImport.Scanned) { EndImport(VR180CameraImport.Message); yield break; }
+
+        Debug.Log($"VR180Viewer [import]: {VR180CameraImport.PhotoCount} photos on {importCamera}, {VR180CameraImport.NewCount} new " +
+                  $"(listed in {Time.realtimeSinceStartup - t0:F1} s)");
+        importStage = ImportStage.Choice;
+        Refresh();
+    }
+
+    void StartImport(int max)
+    {
+        if (importStage != ImportStage.Choice) return;
+        StartCoroutine(ImportPhotos(max));
+    }
+
+    IEnumerator ImportPhotos(int max)
+    {
+        importStage = ImportStage.Importing;
+        VR180CameraImport.StartImport(ImportFolder, max);
+        Refresh();
+        while (VR180CameraImport.State == VR180CameraImport.Importing)
+        {
+            if (IsOpen) statusText.text = ImportProgress();
+            yield return new WaitForSecondsRealtime(0.25f);
+        }
+        EndImport(VR180CameraImport.Message);
+    }
+
+    void CancelImport()
+    {
+        importStage = ImportStage.None;
+        VR180CameraImport.Reset();
+        Refresh();
+    }
+
+    void EndImport(string message)
+    {
+        Debug.Log("VR180Viewer [import]: " + message);
+        importStage = ImportStage.None;
+        VR180CameraImport.Reset();
+        infoCache.Clear();
+        notice = string.IsNullOrEmpty(message) ? "Import stopped." : message;
+        Refresh();
+    }
+
     static List<string> PhotosIn(string dir)
     {
         try { return Directory.EnumerateFiles(dir).Where(IsPhotoFile).ToList(); }
@@ -423,6 +571,7 @@ public class VR180PhotoPicker : MonoBehaviour
             return Directory.GetDirectories(dir)
                 .Where(d => !Path.GetFileName(d).StartsWith("."))
                 .Where(d => string.IsNullOrEmpty(ExcludedFolder) || !SamePath(d, ExcludedFolder))
+                .Where(d => !string.Equals(Path.GetFileName(d), VR180Fisheye.CalibrationFolderName, StringComparison.OrdinalIgnoreCase))
                 .OrderBy(d => d, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }
