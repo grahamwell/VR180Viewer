@@ -23,6 +23,14 @@ Material:
   m_SavedProperties:
     serializedVersion: 3
     m_TexEnvs:
+    - _FillMap0:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    - _FillMap1:
+        m_Texture: {fileID: 0}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
     - _HoldTex:
         m_Texture: {fileID: 0}
         m_Scale: {x: 1, y: 1}
@@ -43,15 +51,18 @@ Material:
     - _Fade: 1
     - _FillBlur: 0.053
     - _FillFadeDegrees: 90.7
+    - _FillMapSize: 0
     - _FillMirror: 1
     - _FillMonoDegrees: 6
     - _HoldMix: 0
     - _LayerMode: 0
     - _MaxMip: 13
-    - _MipBias: -0.80945504
+    - _MipBias: -0.002620995
     - _Saturation: 1
     - _StereoSBS: 1
     m_Colors:
     - _Coverage: {r: -1.5707964, g: 1.5707964, b: -1.5707964, a: 1.5707964}
+    - _Parallax: {r: 0, g: 0, b: 0, a: 0}
+    - _Zoom: {r: 1, g: 0, b: 0, a: 0}
   m_BuildTextureStacks: []
   m_AllowLocking: 1

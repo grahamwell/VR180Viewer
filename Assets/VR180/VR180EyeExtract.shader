@@ -5,6 +5,10 @@
 // The photo's brightness/contrast/saturation adjustments are baked in here too.
 // Fisheye mode (_Fisheye = 1): the source is an unprocessed QooCam photo (two fisheye circles),
 // and each eye is converted straight from it (VR180Fisheye.hlsl), with no full-size copy between.
+// Telephoto zoom (15 November 2026, _TeleZoom.x > 1): the zoomed view is baked into the image,
+// the same "squashed sphere" mapping as VR180/StereoEquirect (tan(source) = tan(view) / zoom about
+// the axis at longitude _TeleZoom.y, latitude _TeleZoom.z), so the Quest's layer shows a sharp
+// telephoto view with its usual (unzoomed) angles. Magnified samples use Catmull-Rom.
 
 Shader "Hidden/VR180/EyeExtract"
 {
@@ -43,6 +47,35 @@ Shader "Hidden/VR180/EyeExtract"
             float _FlipY;
             float _ForceOpaque;    // diagnostic: ignore the feathered edge
             float _Exposure, _Contrast, _Saturation;   // baked into the layer image
+            float4 _TeleZoom;      // x: telephoto magnification (> 1 = on); y, z: axis longitude, latitude (radians)
+
+            // Catmull-Rom from the source's texels in 9 bilinear taps (for magnified samples)
+            float3 EyeCatmullRom(float2 uv)
+            {
+                float2 size = _MainTex_TexelSize.zw;
+                float2 pos = uv * size;
+                float2 p1 = floor(pos - 0.5) + 0.5;
+                float2 f = pos - p1;
+                float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+                float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+                float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+                float2 w3 = f * f * (-0.5 + 0.5 * f);
+                float2 w12 = w1 + w2;
+                float2 t0 = (p1 - 1.0) / size;
+                float2 t3 = (p1 + 2.0) / size;
+                float2 t12 = (p1 + w2 / w12) / size;
+                float3 c = 0.0;
+                c += SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, float2(t0.x,  t0.y),  0).rgb * w0.x  * w0.y;
+                c += SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, float2(t12.x, t0.y),  0).rgb * w12.x * w0.y;
+                c += SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, float2(t3.x,  t0.y),  0).rgb * w3.x  * w0.y;
+                c += SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, float2(t0.x,  t12.y), 0).rgb * w0.x  * w12.y;
+                c += SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, float2(t12.x, t12.y), 0).rgb * w12.x * w12.y;
+                c += SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, float2(t3.x,  t12.y), 0).rgb * w3.x  * w12.y;
+                c += SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, float2(t0.x,  t3.y),  0).rgb * w0.x  * w3.y;
+                c += SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, float2(t12.x, t3.y),  0).rgb * w12.x * w3.y;
+                c += SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, float2(t3.x,  t3.y),  0).rgb * w3.x  * w3.y;
+                return max(c, 0.0);
+            }
 
             struct Attributes
             {
@@ -74,7 +107,24 @@ Shader "Hidden/VR180/EyeExtract"
                 float2 span = _Coverage.yw - _Coverage.xz;
                 float lon = _Coverage.x + img.x * span.x;
                 float lat = _Coverage.z + img.y * span.y;
-                float inside = min(lon - _Coverage.x, _Coverage.y - lon) * cos(lat);
+                bool tele = _TeleZoom.x > 1.0001;
+                if (tele)
+                {
+                    // Where this view direction comes from in the photo, zoomed (see the header)
+                    float3 d = float3(cos(lat) * sin(lon), sin(lat), cos(lat) * cos(lon));
+                    float cz = cos(_TeleZoom.z);
+                    float3 axis = float3(cz * sin(_TeleZoom.y), sin(_TeleZoom.z), cz * cos(_TeleZoom.y));
+                    float along = dot(d, axis);
+                    d = normalize(axis * along + (d - axis * along) / _TeleZoom.x);
+                    lon = atan2(d.x, d.z);
+                    lat = asin(clamp(d.y, -1.0, 1.0));
+                    img = float2((lon - _Coverage.x) / span.x, (lat - _Coverage.z) / span.y);
+                }
+                // (great-circle distance to the nearer side edge, which matters near the poles,
+                // where the side edges of a 180-degree photo meet)
+                float cosLat = cos(lat);
+                float inside = min(asin(saturate(cosLat * sin(clamp(lon - _Coverage.x, 0.0, 1.5707963)))),
+                                   asin(saturate(cosLat * sin(clamp(_Coverage.y - lon, 0.0, 1.5707963)))));
                 if (_Coverage.w < 1.5707) inside = min(inside, _Coverage.w - lat);
                 if (_Coverage.z > -1.5707) inside = min(inside, lat - _Coverage.z);
                 float alpha = smoothstep(0.0, 1.0, saturate(degrees(max(inside, 0.0)) / max(_EdgeFeather, 0.01)));
@@ -87,9 +137,9 @@ Shader "Hidden/VR180/EyeExtract"
                 }
                 else
                 {
-                    float2 tex = img;
-                    if (_StereoSBS > 0.5) tex.x = (img.x + _Eye) * 0.5;
-                    col = SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, tex, 0).rgb;
+                    float2 tex = saturate(img);
+                    if (_StereoSBS > 0.5) tex.x = (tex.x + _Eye) * 0.5;
+                    col = tele ? EyeCatmullRom(tex) : SAMPLE_TEXTURE2D_LOD(_MainTex, sampler_MainTex, tex, 0).rgb;
                 }
 
                 // Picture adjustments, the same as VR180/StereoEquirect applies

@@ -7,9 +7,13 @@
 //   (Editor: F frame/capture, Escape cancel, = and - zoom.)
 //
 // The export is rendered from the full-resolution photo (re-decoded from disk), not from
-// the headset view: the left eye, through a level virtual camera shifted up or down to
-// where you're looking, so vertical lines stay vertical. Pictures go to Pictures/VR180 Flat
-// on the Quest (visible over USB) or to "VR180 Flat" beside the PC photo folder.
+// the headset view: the left eye, through a virtual camera aimed where you're looking (turned
+// and tilted, but never rolled, so the frame stays upright), so the picture is what you see in
+// the frame, in any direction, up to straight up or down. Beyond the photo's edge (e.g. past
+// the zenith) it is black. Optionally (the viewer's Flat Export Keeps Verticals) the camera stays
+// level and the picture is shifted up or down instead, like a shift lens, so vertical lines stay
+// vertical (pitch limited to 50 degrees). Pictures go to Pictures/VR180 Flat on the Quest
+// (visible over USB) or to "VR180 Flat" beside the PC photo folder.
 
 using System;
 using System.Collections;
@@ -28,7 +32,7 @@ public class VR180FlatExport : MonoBehaviour
     const float Aspect = 9f / 16f;           // height / width
     const float FrameDistance = 3f;          // metres; where the viewfinder frame is drawn
     const float MinFov = 25f, MaxFov = 110f; // horizontal field of view limits (degrees)
-    const float MaxPitch = 50f;              // furthest up/down the shifted frame can go
+    const float MaxShiftPitch = 50f;         // furthest up/down the shifted frame can go (Keeps Verticals)
     const int MinWidth = 1920, MaxWidth = 4096;
     const int JpegQuality = 92;
 
@@ -49,7 +53,8 @@ public class VR180FlatExport : MonoBehaviour
     float messageUntil;
 
     // Framing captured at the moment of the shot
-    float shotYaw, shotShift;
+    Quaternion shotCam;
+    float shotShift;
 
     // ------------------------------------------------------------------ setup
 
@@ -138,21 +143,32 @@ public class VR180FlatExport : MonoBehaviour
         viewer.SetFraming(false);
     }
 
-    // Current level camera direction (yaw) and vertical shift from where the head points
-    void GetFraming(out float yawDeg, out float shift)
+    // The virtual camera's orientation and vertical shift, from where the head points.
+    // The head's rotation is yaw, then pitch, then roll (Unity's Euler order), so dropping the
+    // roll leaves the camera aimed where you look with its frame upright. Looking straight up or
+    // down, Unity folds the roll into the yaw, so the frame's top is towards the top of your head.
+    void GetFraming(out Quaternion cam, out float shift)
     {
-        Vector3 f = viewer.Head.forward;
-        yawDeg = Mathf.Atan2(f.x, f.z) * Mathf.Rad2Deg;
-        float pitch = Mathf.Clamp(Mathf.Asin(Mathf.Clamp(f.y, -1f, 1f)) * Mathf.Rad2Deg, -MaxPitch, MaxPitch);
-        shift = Mathf.Tan(pitch * Mathf.Deg2Rad);
+        Transform h = viewer.Head;
+        float yawDeg = h.rotation.eulerAngles.y;
+        float pitch = Mathf.Asin(Mathf.Clamp(h.forward.y, -1f, 1f)) * Mathf.Rad2Deg;   // + = up
+        if (viewer.flatExportKeepsVerticals)
+        {
+            cam = Quaternion.Euler(0f, yawDeg, 0f);
+            shift = Mathf.Tan(Mathf.Clamp(pitch, -MaxShiftPitch, MaxShiftPitch) * Mathf.Deg2Rad);
+        }
+        else
+        {
+            cam = Quaternion.Euler(-pitch, yawDeg, 0f);
+            shift = 0f;
+        }
     }
 
-    // Places the frame where the exported picture's edges are: a rectangle on a vertical
-    // plane straight ahead (level), shifted up or down to the gaze
+    // Places the frame where the exported picture's edges are: a rectangle square-on to the
+    // camera's direction (shifted up or down in Keeps Verticals mode)
     void UpdateFrame()
     {
-        GetFraming(out float yawDeg, out float shift);
-        Quaternion cam = Quaternion.Euler(0f, yawDeg, 0f);
+        GetFraming(out Quaternion cam, out float shift);
         float halfW = Mathf.Tan(FieldOfView * 0.5f * Mathf.Deg2Rad) * FrameDistance;
         Vector3 centre = viewer.Head.position + cam * new Vector3(0f, shift, 1f) * FrameDistance;
 
@@ -165,12 +181,12 @@ public class VR180FlatExport : MonoBehaviour
     IEnumerator Capture()
     {
         state = State.Saving;
-        GetFraming(out shotYaw, out shotShift);
+        GetFraming(out shotCam, out shotShift);
         float fov = FieldOfView;
         string source = viewer.CurrentPhotoPath;
         Vector4 cov = viewer.CurrentCoverage;
         bool sbs = viewer.CurrentSideBySide;
-        Quaternion camToImage = Quaternion.Inverse(viewer.ImageToWorld) * Quaternion.Euler(0f, shotYaw, 0f);
+        Quaternion camToImage = Quaternion.Inverse(viewer.ImageToWorld) * shotCam;
         ShowMessage("Saving...", 60f);
         float t0 = Time.realtimeSinceStartup;
 
@@ -236,7 +252,7 @@ public class VR180FlatExport : MonoBehaviour
         }
 
         AnnounceToGallery(path);
-        Debug.Log($"VR180Viewer [flat]: saved {path} ({w}x{h}, {fov:F0} deg, shift {shotShift:F2}) in {Time.realtimeSinceStartup - t0:F2}s");
+        Debug.Log($"VR180Viewer [flat]: saved {path} ({w}x{h}, {fov:F0} deg, pitch {-Mathf.DeltaAngle(0f, shotCam.eulerAngles.x):F0} deg, shift {shotShift:F2}) in {Time.realtimeSinceStartup - t0:F2}s");
         ShowMessage("Saved " + Path.GetFileName(path), 2.5f);
         yield return new WaitForSecondsRealtime(2.5f);
         EndFraming();

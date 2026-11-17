@@ -207,6 +207,8 @@ public class CameraImport {
             if (name == null) continue;
             String lower = name.toLowerCase(Locale.ROOT);
             if (!lower.endsWith(".jpg") && !lower.endsWith(".jpeg")) continue;
+            // The QooCam keeps a small stitched preview (..._Thumbstitched.JPG) beside each photo: not a photo
+            if (lower.contains("thumbstitched")) continue;
             Item it = new Item();
             it.handle = h;
             it.name = name;

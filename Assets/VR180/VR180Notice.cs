@@ -64,6 +64,7 @@ public class VR180Notice : MonoBehaviour
         f.y = 0f;
         if (f.sqrMagnitude < 1e-4f) f = Vector3.forward;
         f.Normalize();
+        canvas.transform.localScale = Vector3.one * 0.001f * VR180Viewer.UIScale;
         Vector3 pos = head.position + f * 1.4f + Vector3.down * 0.05f;
         canvas.transform.SetPositionAndRotation(pos, Quaternion.LookRotation(f, Vector3.up));
     }

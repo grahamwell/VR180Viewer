@@ -1,4 +1,5 @@
-// VR180Adjustments: per-photo picture adjustments (brightness, contrast, saturation, convergence),
+// VR180Adjustments: per-photo picture adjustments (brightness, contrast, saturation, convergence,
+// and for raw QooCam photos whether to level the horizon),
 // remembered by file name in adjustments.json in the app's own storage, so a photo looks
 // the same every time it's shown. Photos with no saved entry use the neutral defaults.
 //
@@ -18,11 +19,12 @@ public static class VR180Adjustments
     [Serializable]
     public struct Values
     {
-        public float exposure;      // stops (-2..2)
+        public float exposure;      // stops (-2..4)
         public float contrast;      // 0.5..1.5, 1 = unchanged
         public float saturation;    // 0..2, 1 = unchanged
         public float convergence;   // degrees between the eyes' images, + = crossed (nearer)
         public bool ownConvergence; // false: this photo follows the default convergence
+        public bool keepTilt;       // raw QooCam photos: true = don't level the horizon (show it as the camera was held)
 
         /// Fully neutral (convergence 0); used to leave the material asset as it was
         public static Values Default => new Values { exposure = 0f, contrast = 1f, saturation = 1f, convergence = 0f };
@@ -31,10 +33,11 @@ public static class VR180Adjustments
         public static Values ForNewPhoto => new Values { exposure = 0f, contrast = 1f, saturation = 1f, convergence = DefaultConvergence };
 
         /// Nothing worth saving for this photo
-        public bool IsDefault => SameImage(this, Default) && !ownConvergence;
+        public bool IsDefault => SameImage(this, Default) && !ownConvergence && !keepTilt;
 
         public static bool Same(Values a, Values b) =>
-            SameImage(a, b) && Mathf.Abs(a.convergence - b.convergence) < 0.005f && a.ownConvergence == b.ownConvergence;
+            SameImage(a, b) && Mathf.Abs(a.convergence - b.convergence) < 0.005f && a.ownConvergence == b.ownConvergence &&
+            a.keepTilt == b.keepTilt;
 
         /// The settings that change the picture itself (and so are baked into the layer image)
         public static bool SameImage(Values a, Values b) =>
@@ -58,6 +61,7 @@ public static class VR180Adjustments
         public string file;
         public float exposure, contrast, saturation, convergence;
         public bool hasConvergence;
+        public bool keepTilt;
     }
     [Serializable] class Store { public List<Entry> photos = new List<Entry>(); }
 
@@ -103,7 +107,8 @@ public static class VR180Adjustments
                 s_Map[e.file] = new Values
                 {
                     exposure = e.exposure, contrast = e.contrast, saturation = e.saturation,
-                    convergence = own ? e.convergence : 0f, ownConvergence = own
+                    convergence = own ? e.convergence : 0f, ownConvergence = own,
+                    keepTilt = e.keepTilt
                 };
             }
             Debug.Log($"VR180Viewer [adjust]: {s_Map.Count} saved adjustment(s) loaded from {FilePath}");
@@ -123,7 +128,8 @@ public static class VR180Adjustments
                 store.photos.Add(new Entry
                 {
                     file = kv.Key, exposure = kv.Value.exposure, contrast = kv.Value.contrast, saturation = kv.Value.saturation,
-                    convergence = kv.Value.ownConvergence ? kv.Value.convergence : 0f, hasConvergence = kv.Value.ownConvergence
+                    convergence = kv.Value.ownConvergence ? kv.Value.convergence : 0f, hasConvergence = kv.Value.ownConvergence,
+                    keepTilt = kv.Value.keepTilt
                 });
             store.photos.Sort((a, b) => string.CompareOrdinal(a.file, b.file));
 

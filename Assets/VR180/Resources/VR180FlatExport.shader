@@ -1,8 +1,9 @@
 // Used once per export: renders a flat (rectilinear) picture from the full-resolution
 // VR180 photo, as an ordinary camera would see it.
 //
-// The virtual camera is level (no tilt) and its image is shifted up or down to where you
-// were looking, like an architectural shift lens, so vertical lines stay vertical.
+// The virtual camera is aimed where you were looking (_CamToImage includes the tilt; _Shift 0),
+// or, with the viewer's Flat Export Keeps Verticals, kept level with its image shifted up or down
+// (_Shift), like an architectural shift lens, so vertical lines stay vertical.
 // It samples the left eye with Catmull-Rom bicubic filtering straight from the source
 // texels, so the result is as sharp as the photo allows. Lives in a Resources folder
 // so it's always included in builds (VR180FlatExport loads it by name).
@@ -70,7 +71,7 @@ Shader "Hidden/VR180/FlatExport"
                 float2 uv = i.uv;
                 if (_FlipY > 0.5) uv.y = 1.0 - uv.y;
 
-                // Ray through this output pixel, for a level camera looking along +z
+                // Ray through this output pixel, for a camera looking along +z (then turned by _CamToImage)
                 float2 p = (uv * 2.0 - 1.0) * float2(_TanHalf, _TanHalf * _Aspect) + float2(0.0, _Shift);
                 float3 d = mul((float3x3)_CamToImage, normalize(float3(p, 1.0)));
 

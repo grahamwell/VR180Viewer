@@ -767,6 +767,28 @@ MonoBehaviour:
   targetOpenXRApiVersion: 
   required: 0
   customRuntimeLoaderName: 
+--- !u!114 &-3847878398400765043
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b3e8fbe7591611545bb95b5ff92ef1f3, type: 3}
+  m_Name: VR180LayerSettingsFeature Android
+  m_EditorClassIdentifier: Assembly-CSharp::VR180LayerSettingsFeature
+  m_enabled: 1
+  nameUi: VR180 Layer Sharpening (experiment)
+  version: 0.1.0
+  featureIdInternal: com.grahamwell.vr180viewer.layersettings
+  openxrExtensionStrings: XR_FB_composition_layer_settings
+  company: VR180 Viewer
+  priority: 0
+  targetOpenXRApiVersion: 
+  required: 0
+  customRuntimeLoaderName: 
 --- !u!114 &-2778858118241658710
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -1077,8 +1099,8 @@ MonoBehaviour:
   features:
   - {fileID: 7011443450567333355}
   - {fileID: -671281728444007487}
-  - {fileID: -901939997048047619}
-  - {fileID: -1734471456787174204}
+  - {fileID: 1962673384086937814}
+  - {fileID: 6349095229616181692}
   - {fileID: 8980318060753866109}
   - {fileID: -6559185765804338520}
   - {fileID: -4756202077021157709}
@@ -1089,7 +1111,7 @@ MonoBehaviour:
   - {fileID: 348827886137839178}
   - {fileID: -7499073031166464939}
   - {fileID: 7666556398442971420}
-  - {fileID: -7343570946846779558}
+  - {fileID: -7539054018106773735}
   - {fileID: -1458112850749957843}
   - {fileID: 6314702966012291616}
   - {fileID: -4363231183632145407}
@@ -1121,6 +1143,7 @@ MonoBehaviour:
   - {fileID: -4622232450558264841}
   - {fileID: 2494903514831033625}
   - {fileID: -8081981933519754069}
+  - {fileID: -3847878398400765043}
   - {fileID: 4882435304454363559}
   - {fileID: 4260254090862286588}
   customLoaderName: 

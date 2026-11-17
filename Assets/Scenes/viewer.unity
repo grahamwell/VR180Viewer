@@ -536,6 +536,8 @@ MonoBehaviour:
   photoLayerRight: {fileID: 1068868245}
   eyeExtractShader: {fileID: 4800000, guid: 37a6b0bf95b83aa4480ee00c7545a504, type: 3}
   useLayer: 1
+  layerOnPC: 0
+  pcRenderScale: 2
   layerRadius: 50
   compensateOpenXRLowerAngle: 1
   flipLayerVertically: 0
@@ -544,9 +546,35 @@ MonoBehaviour:
   layerHalvings: 0
   sphereHalvingsWithLayer: 2
   pcFolder: E:\qoocam
+  pcFavouritesFolder: Favourites
   questSubfolder: Photos
   questPhotoRoot: /storage/emulated/0/Pictures
+  questFlatFolder: /storage/emulated/0/Pictures/VR180 Flat
+  flipFlatExport: 0
+  levelFisheyePhotos: 1
+  lensPatch: 1
+  levelByTurningSphere: 1
+  rollDownStart: 40
+  rollDownFull: 60
+  rollSideStart: 30
+  rollSideFull: 45
+  zoomMin: 0.5
+  zoomMax: 2
+  zoomSpeed: 1
+  zoomCropFlipY: 0
+  zoomVerticalFollow: 0
+  zoomStyle: 1
+  tiltHintDegrees: 15
+  layerFilter: 2
+  layerFilterFromZoom: 1
+  neckToEyes: {x: 0, y: 0.075, z: 0.0805}
+  flatExportKeepsVerticals: 0
+  useFillMaps: 1
+  uiScale: 0.7
   pickerBackdropBlur: 0.3
+  flipThumbnails: 0
+  stereoThumbnails: 1
+  thumbnailDepth: 0.015
   blurTransition: 1
   blurOutSeconds: 0.25
   colourBlendSeconds: 0.4
@@ -785,7 +813,7 @@ GameObject:
   m_IsActive: 1
 --- !u!114 &2098994341
 MonoBehaviour:
-  m_ObjectHideFlags: 49
+  m_ObjectHideFlags: 2
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}

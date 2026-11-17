@@ -18,9 +18,21 @@
 //   then ReleaseImage(layer) and free the texture.
 //
 // It is only installed when the runtime supports XR_KHR_composition_layer_equirect2 (the Quest).
+//
+// Zoom (11 November 2026): the viewer can ask for part of the image over different angles
+// (SetZoom); applied every frame in ActiveNativeLayer, so the write-once swapchain is untouched.
 // Over Link that extension is missing, so Unity's own handler stays in charge.
+//
+// Layer settings (experiment, 12 November 2026): XR_FB_composition_layer_settings lets an app ask
+// the Quest's compositor to sharpen and/or supersample a layer. When the runtime has enabled the
+// extension (the "VR180 Layer Sharpening" OpenXR feature asks for it) and SettingsFlags is not 0,
+// an XrCompositionLayerSettingsFB is chained onto each layer's next pointer every frame. Done with
+// MemoryMarshal on the layer struct's bytes, so no unsafe code is needed. Whether the Quest honours
+// it for equirect layers (it's documented for quad and cylinder layers) is what we're testing.
 
+using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using Unity.XR.CompositionLayers;
 using Unity.XR.CompositionLayers.Extensions;
 using Unity.XR.CompositionLayers.Layers;
@@ -50,6 +62,10 @@ public class VR180StereoEquirectHandler : OpenXRCustomLayerHandler<XrComposition
         public int layerId = -1;
         public bool requestedThisFrame;
         public bool loggedResident;
+        // Zoom (set by the viewer every frame): show only part of the image, over these angles
+        public bool zoomed;
+        public Rect crop;                   // part of the image: x from the left, y from the photo's top, 0..1
+        public float central, upper, lower; // radians, as in the layer data
     }
 
     static readonly Dictionary<CompositionLayer, LayerState> s_States = new Dictionary<CompositionLayer, LayerState>();
@@ -61,6 +77,81 @@ public class VR180StereoEquirectHandler : OpenXRCustomLayerHandler<XrComposition
     /// True once this handler has replaced Unity's for the current XR session.
     public static bool Active { get; private set; }
 
+    /// The XR session ended (for example the headset went to sleep): the swapchains, and the photo
+    /// in them, are gone. The viewer rebuilds the layer once Active is true again.
+    public static event Action SessionStopped;
+
+    // ------------------------------------------------------------------ layer settings (experiment)
+
+    public const string LayerSettingsExtension = "XR_FB_composition_layer_settings";
+
+    // XrCompositionLayerSettingsFlagsFB
+    public const ulong NormalSuperSampling = 0x1, QualitySuperSampling = 0x2, NormalSharpening = 0x4, QualitySharpening = 0x8;
+
+    /// Flags to ask for on both layers this frame (0 = none); set by the viewer every frame
+    public static ulong SettingsFlags;
+
+    /// True if the runtime enabled XR_FB_composition_layer_settings for this session
+    public static bool SettingsSupported { get; private set; }
+
+    const uint XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB = 1000204000;
+    static IntPtr s_Settings;          // one XrCompositionLayerSettingsFB (24 bytes), shared by both layers, kept for the app's life
+    static int s_NextOffset = -1;      // where the layer struct's next pointer is
+    static ulong s_LoggedFlags = ulong.MaxValue;
+    static bool s_ChainWarned;
+
+    // Puts our settings struct on (or takes it off) the layer's next chain
+    static void ApplySettings(ref XrCompositionLayerEquirect2KHR layer)
+    {
+        if (s_NextOffset < 0)
+        {
+            try { s_NextOffset = (int)Marshal.OffsetOf(typeof(XrCompositionLayerEquirect2KHR), "Next"); }
+            catch (Exception e)
+            {
+                s_NextOffset = IntPtr.Size == 8 ? 8 : 4;   // after the 32-bit type, aligned
+                Debug.LogWarning($"VR180Viewer [layer]: couldn't find the layer's next field ({e.Message}); assuming offset {s_NextOffset}");
+            }
+        }
+        Span<byte> bytes = MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref layer, 1));
+        Span<byte> nextBytes = bytes.Slice(s_NextOffset, IntPtr.Size);
+        IntPtr next = MemoryMarshal.Read<IntPtr>(nextBytes);
+        ulong flags = SettingsSupported ? SettingsFlags : 0;
+
+        if (flags != 0)
+        {
+            if (next != IntPtr.Zero && next != s_Settings)
+            {
+                if (!s_ChainWarned)
+                {
+                    s_ChainWarned = true;
+                    Debug.LogWarning("VR180Viewer [layer]: the layer already has an extension chain; not adding the layer settings");
+                }
+                return;
+            }
+            if (s_Settings == IntPtr.Zero)
+            {
+                s_Settings = Marshal.AllocHGlobal(24);
+                Marshal.WriteInt32(s_Settings, 0, (int)XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB);
+                Marshal.WriteInt32(s_Settings, 4, 0);
+                Marshal.WriteIntPtr(s_Settings, 8, IntPtr.Zero);
+            }
+            Marshal.WriteInt64(s_Settings, 16, (long)flags);
+            IntPtr ours = s_Settings;
+            MemoryMarshal.Write(nextBytes, ref ours);
+        }
+        else if (next != IntPtr.Zero && next == s_Settings)
+        {
+            IntPtr none = IntPtr.Zero;
+            MemoryMarshal.Write(nextBytes, ref none);
+        }
+
+        if (flags != s_LoggedFlags)
+        {
+            s_LoggedFlags = flags;
+            Debug.Log($"VR180Viewer [layer]: layer settings {(flags == 0 ? "off" : "0x" + flags.ToString("X"))}");
+        }
+    }
+
     static LayerState State(CompositionLayer layer)
     {
         if (!s_States.TryGetValue(layer, out var s)) s_States[layer] = s = new LayerState();
@@ -68,6 +159,23 @@ public class VR180StereoEquirectHandler : OpenXRCustomLayerHandler<XrComposition
     }
 
     // ------------------------------------------------------------------ API for the viewer
+
+    /// Which way the swapchain image's rows run relative to the photo: false = the first row is the
+    /// photo's top (Vulkan, D3D), true = its bottom (OpenGL ES). Set by the viewer.
+    public static bool CropFromBottom;
+
+    /// Zoom: show only the crop part of the photo (x from the left, y from the photo's top, 0..1),
+    /// over these angles (radians). Pass zoomed = false for the whole photo with the layer data's angles.
+    public static void SetZoom(CompositionLayer layer, bool zoomed, Rect crop, float central, float upper, float lower)
+    {
+        if (layer == null) return;
+        var s = State(layer);
+        s.zoomed = zoomed;
+        s.crop = crop;
+        s.central = central;
+        s.upper = upper;
+        s.lower = lower;
+    }
 
     public static void SetEye(CompositionLayer layer, Eye eye)
     {
@@ -125,6 +233,8 @@ public class VR180StereoEquirectHandler : OpenXRCustomLayerHandler<XrComposition
     static void OnStopped()
     {
         Active = false;
+        SettingsSupported = false;
+        s_LoggedFlags = ulong.MaxValue;
         s_RegisteredThisSession = false;
         var dead = new List<CompositionLayer>();
         foreach (var kv in s_States)
@@ -137,6 +247,8 @@ public class VR180StereoEquirectHandler : OpenXRCustomLayerHandler<XrComposition
         }
         foreach (var k in dead) s_States.Remove(k);
         lock (s_TexIdLock) s_CurrentTexIds.Clear();
+        Debug.Log("VR180Viewer [layer]: XR layer provider stopped");
+        SessionStopped?.Invoke();
     }
 
     static void Register()
@@ -160,6 +272,11 @@ public class VR180StereoEquirectHandler : OpenXRCustomLayerHandler<XrComposition
         }
         Active = true;
         Debug.Log("VR180Viewer [layer]: stereo equirect handler installed (write-once swapchains)");
+        SettingsSupported = OpenXRRuntime.IsExtensionEnabled(LayerSettingsExtension);
+        Debug.Log(SettingsSupported
+            ? "VR180Viewer [layer]: " + LayerSettingsExtension + " enabled, so the layers can be sharpened/supersampled"
+            : "VR180Viewer [layer]: " + LayerSettingsExtension + " not enabled (tick \"VR180 Layer Sharpening\" in the Android OpenXR features, " +
+              "or the runtime doesn't have it); layer filtering unavailable");
     }
 
     // ------------------------------------------------------------------ swapchain writing
@@ -333,6 +450,42 @@ public class VR180StereoEquirectHandler : OpenXRCustomLayerHandler<XrComposition
         nativeLayer.Pose = PoseOf(layerInfo);
 
         var s = State(layerInfo.Layer);
+
+        // Zoom: part of the image over different angles; otherwise all of it over the layer data's angles
+        if (TryGetSwapSize(layerInfo, out int sw, out int sh))
+        {
+            var data = (EquirectMeshLayerData)layerInfo.Layer.LayerData;
+            if (s.zoomed)
+            {
+                int x0 = Mathf.Clamp(Mathf.RoundToInt(s.crop.xMin * sw), 0, sw - 1);
+                int x1 = Mathf.Clamp(Mathf.RoundToInt(s.crop.xMax * sw), x0 + 1, sw);
+                float top = CropFromBottom ? 1f - s.crop.yMax : s.crop.yMin;
+                float bottom = CropFromBottom ? 1f - s.crop.yMin : s.crop.yMax;
+                int y0 = Mathf.Clamp(Mathf.RoundToInt(top * sh), 0, sh - 1);
+                int y1 = Mathf.Clamp(Mathf.RoundToInt(bottom * sh), y0 + 1, sh);
+                nativeLayer.SubImage.ImageRect = new XrRect2Di
+                {
+                    Offset = new XrOffset2Di { X = x0, Y = y0 },
+                    Extent = new XrExtent2Di { Width = x1 - x0, Height = y1 - y0 }
+                };
+                nativeLayer.CentralHorizontalAngle = s.central;
+                nativeLayer.UpperVerticalAngle = s.upper;
+                nativeLayer.LowerVerticalAngle = s.lower;
+            }
+            else
+            {
+                nativeLayer.SubImage.ImageRect = new XrRect2Di
+                {
+                    Offset = new XrOffset2Di { X = 0, Y = 0 },
+                    Extent = new XrExtent2Di { Width = sw, Height = sh }
+                };
+                nativeLayer.CentralHorizontalAngle = data.CentralHorizontalAngle;
+                nativeLayer.UpperVerticalAngle = data.UpperVerticalAngle;
+                nativeLayer.LowerVerticalAngle = data.LowerVerticalAngle;
+            }
+            nativeLayer.Radius = data.Radius;
+        }
+        ApplySettings(ref nativeLayer);
         s.layerId = layerInfo.Id;
         s.requestedThisFrame = true;
         OpenXRLayerUtility.RequestRenderTextureId(layerInfo.Id, s_OnTexId);

@@ -10,17 +10,32 @@
 //     VR180StereoEquirectHandler, because Unity's own handler shows one image to both eyes.
 //
 // Controls:  either thumbstick pushed right = next, left = previous,
-//            A = picture adjustments panel (brightness, contrast, saturation, convergence, sharpness),
-//            B = open/close the folder picker (which also has Favourites, Tidy and Exit),
+//            A = open/close the folder picker (which also has Favourites, Tidy and Exit),
+//            B = picture adjustments panel (brightness, contrast, saturation, convergence, sharpness, levelling),
 //            right trigger = mark/unmark the photo as a favourite (a buzz confirms: one = added, two = removed),
-//            hold the right thumbstick click = recentre,
-//            X = switch the compositor layer on and off (to compare)
-//            Y = switch the layer's radius between its Inspector value and 0 (infinite), for testing
+//            hold the right thumbstick click = recentre (photos otherwise stay where they are; holding
+//            the Quest button to recentre the headset also puts the photo straight ahead),
+//            X = switch the compositor layer on and off (to compare); while zoomed, switch the
+//                layer filter experiment on and off instead (one buzz = on, two = off)
+//            Y = switch the layer's radius between its Inspector value and 0 (infinite), for testing;
+//                while zoomed, flip the layer's crop (diagnostic)
 //            left trigger = frame and save a flat 2D picture (see VR180FlatExport)
-//            (in the Editor: right/left arrow keys, A for adjustments, M for the picker, F for flat export, R, L and K)
+//            either thumbstick up/down = zoom in/out (0.5x to 2x, about the direction you were facing
+//            when you started, but centred on the horizon vertically unless Zoom Vertical Follow is
+//            raised; it pauses at 1x on the way through; resets for each photo). Zooming in is a true
+//            telephoto ("squashed sphere") by default, centred where you look: see Zoom Style. On the
+//            Quest the sharp layer steps aside while zooming and is rebuilt with the zoom baked in
+//            once the stick has been let go (about 2.5 s)
+//            (in the Editor: right/left arrow keys, A for adjustments, M for the picker, F for flat export,
+//            T for the zoom style, R, L and K)
 //
 // On PC (Link, Air Link or the Editor) the compositor layer is switched off by default and the
 // photo is shown on the sphere at full resolution instead: see Layer On PC.
+//
+// Orientation: every photo is centred in the same direction, straight ahead as you were facing
+// when the first one appeared. It doesn't follow your head from photo to photo. The headset's own
+// recentre (hold the Quest button) moves "straight ahead" to where you're facing, and the photo
+// with it; holding the right thumbstick click does the same within the app.
 
 using System;
 using System.Collections;
@@ -37,6 +52,7 @@ using UnityEngine;
 using UnityEngine.InputSystem;
 using UnityEngine.Networking;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
 
 // Runs early, so the layers' poses (roll compensation) are set before the composition layer
 // code reads them in its own Update, avoiding a frame of lag
@@ -68,6 +84,15 @@ public class VR180Viewer : MonoBehaviour
              "and Unity's handler throws an error every frame after a photo of a different size is loaded. " +
              "With it off, PC shows the photo on the sphere at full resolution.")]
     public bool layerOnPC = false;
+
+    [Tooltip("PC only (Link, Air Link, Editor): renders the headset's eye images at this multiple of the runtime's " +
+             "recommended size, by setting the URP asset's Render Scale while the viewer runs (put back on exit). " +
+             "The photo on the sphere is already at full resolution on PC; what limits sharpness there is the eye " +
+             "image's resolution and Link's video encoding, so supersampling (1.3 to 1.7) can help. Costs GPU time: " +
+             "lower it if the view judders. 1 = leave the URP asset alone. The Quest is unaffected.")]
+    [Range(1f, 2f)]
+    public float pcRenderScale = 1.5f;
+    float savedRenderScale = -1f;   // the URP asset's own value, put back in OnDestroy
 
     [Tooltip("Radius of the layer's sphere in metres. 0 means infinitely far away, which is what we want.")]
     public float layerRadius = 0f;
@@ -123,9 +148,110 @@ public class VR180Viewer : MonoBehaviour
              "Tick to level their horizon from the camera's gravity reading, as QooCam Studio does.")]
     public bool levelFisheyePhotos = true;
 
+    [Tooltip("Unprocessed QooCam photos: where one lens sees the other at the edge of its view, show what the other lens sees " +
+             "in that direction instead (like QooCam Studio's lens patch).")]
+    public bool lensPatch = true;
+
+    [Tooltip("Unprocessed QooCam photos: level the horizon by turning the sphere and layers (on), so a shot taken pointing " +
+             "well down or up keeps everything the lenses saw; or inside the conversion as before (off), which cuts off " +
+             "whatever was more than 90 degrees above or below the horizon. Takes effect on the next photo.")]
+    public bool levelByTurningSphere = true;
+
+    [Header("Roll compensation (looking down and to the side)")]
+    [Tooltip("Roll compensation starts when the gaze is this far below the horizon (degrees)...")]
+    public float rollDownStart = 40f;
+    [Tooltip("...and reaches the panel's slider value (its maximum) this far down.")]
+    public float rollDownFull = 60f;
+    [Tooltip("It also needs the gaze turned this far left or right of the photo's centre (degrees)...")]
+    public float rollSideStart = 30f;
+    [Tooltip("...and is at full strength this far round. The two are multiplied together.")]
+    public float rollSideFull = 45f;
+
+    [Header("Zoom (either thumbstick up/down)")]
+    [Tooltip("Smallest magnification (zoomed right out: the whole photo framed by the surround)")]
+    public float zoomMin = 0.5f;
+    [Tooltip("Largest magnification")]
+    public float zoomMax = 2f;
+    [Tooltip("How fast the zoom changes with the stick pushed fully, in doublings per second")]
+    public float zoomSpeed = 1f;
+    [Tooltip("Diagnostic: if zooming in while looking up or down on the Quest shows the wrong part of the photo, tick this " +
+             "(or press Y while zoomed) to crop the layer's image the other way up.")]
+    public bool zoomCropFlipY = false;
+    [Tooltip("How far the zoom's centre follows your gaze up and down: 0 = always on the horizon (keeps the horizon level " +
+             "and straight, but at 2x you can only reach 45 degrees above or below it), 1 = exactly where you look " +
+             "(the horizon curves when you zoom looking well up or down). Left and right always follow the gaze.")]
+    [Range(0f, 1f)]
+    public float zoomVerticalFollow = 0f;
+
+    public enum ZoomStyle { Map, Telephoto }
+    [Tooltip("How zooming in works (zooming out always uses Map). Map: longitude and latitude scaled about the centre " +
+             "(what the Quest's layer can do; bends things above and below the horizon). Telephoto: the \"squashed sphere\": " +
+             "a true telephoto view about where you look, straight lines stay straight and the horizon stays level, " +
+             "magnification strongest at the centre. On the Quest the sharp layer steps aside while the zoom changes " +
+             "(the softer sphere shows it) and is rebuilt with the zoom baked into its image once the stick has been " +
+             "let go for Zoom Settle Seconds (a re-decode, about 2.5 s). T in the Editor switches between the two.")]
+    public ZoomStyle zoomStyle = ZoomStyle.Telephoto;
+    [Tooltip("Quest, Telephoto: how long after the zoom stops changing before the sharp layer is rebuilt with it")]
+    public float zoomSettleSeconds = 0.5f;
+    bool telephotoHidLayer;   // the layer was stepped aside for a telephoto zoom
+    float layerBakeZoom = 1f;          // the telephoto zoom baked into the layer's image (1 = none)
+    Vector2 layerBakeCentre;
+    float lastZoomTime = -10f;         // when the zoom last changed
+    static readonly int TeleZoomId = Shader.PropertyToID("_TeleZoom");
+
+    [Header("Tilt hint")]
+    [Tooltip("For a photo levelled by turning the sphere whose centre is at least this far above or below both the " +
+             "horizon and where you're looking (degrees), a brief arrow points that way as it sharpens in. 0 = never.")]
+    public float tiltHintDegrees = 15f;
+    VR180TiltHint tiltHint;
+
+    public enum LayerFilter { Off, Sharpen, QualitySharpen, SuperSample, QualitySuperSample, SharpenAndSuperSample, QualityBoth }
+
+    [Header("Layer filtering experiment (Quest; needs the VR180 Layer Sharpening OpenXR feature)")]
+    [Tooltip("What to ask the Quest's compositor to do to the photo layers (XR_FB_composition_layer_settings). " +
+             "While zoomed, the left X button switches it on and off to compare (one buzz = on, two = off).")]
+    public LayerFilter layerFilter = LayerFilter.QualitySharpen;
+    [Tooltip("Only use the filter above this magnification (1 = only when zoomed in; 0 = always)")]
+    public float layerFilterFromZoom = 1f;
+    bool layerFilterOn = true;   // the X button's switch (while zoomed)
+
+    [Header("Head-turn parallax (distance set in the adjustments panel)")]
+    [Tooltip("Where the point between your eyes sits relative to the neck's pivot, in metres (x right, y up, z ahead). " +
+             "Turning the head moves the eyes by this offset turned; the photo is moved to match.")]
+    public Vector3 neckToEyes = new Vector3(0f, 0.075f, 0.0805f);
+
+    [Tooltip("Flat export: keep the virtual camera level and shift the picture up or down to where you look, so vertical lines " +
+             "stay vertical (like a shift lens). Untick (the default) to aim the camera where you look, so the picture is " +
+             "exactly what you see in the frame, in any direction.")]
+    public bool flatExportKeepsVerticals = false;
+
+    [Tooltip("Diagnostic: draw the soft surround from the pole-free fill maps (on) or from the photo's own mips, as before (off). Can be changed while running.")]
+    public bool useFillMaps = true;
+
+    [Tooltip("Size of the picker, adjustments panel and notices: 1 = the original size, 0.7 = 30% smaller. " +
+             "Takes effect the next time a panel opens.")]
+    [Range(0.4f, 1.2f)]
+    public float uiScale = 0.7f;
+
+    /// The panels' size factor (the Inspector's UI Scale), read when they open
+    public static float UIScale = 0.7f;
+
     [Tooltip("How much the photo behind the picker is softened, from 0 (not at all) to 1 (its average colour).")]
     [Range(0f, 1f)]
     public float pickerBackdropBlur = 0.3f;
+
+    [Tooltip("Tick if the picker's thumbnails come out upside down. Thumbnails already made stay as they " +
+             "are: delete the app's thumbs folder (persistentDataPath/thumbs) to remake them.")]
+    public bool flipThumbnails = false;
+
+    [Tooltip("Show the picker's thumbnails in stereo (each eye its own picture).")]
+    public bool stereoThumbnails = true;
+
+    [Tooltip("How far behind the panel distant scenery appears in the thumbnails: each eye's picture is " +
+             "shifted by this fraction of its width (0 = distant things on the panel's surface, near things in front of it). " +
+             "Takes effect the next time the picker opens.")]
+    [Range(0f, 0.06f)]
+    public float thumbnailDepth = 0.015f;
 
     [Header("Transitions")]
     [Tooltip("Blur each photo away to its average colour, hold that colour while the next one loads, " +
@@ -164,6 +290,10 @@ public class VR180Viewer : MonoBehaviour
     static readonly int SaturationId   = Shader.PropertyToID("_Saturation");
     static readonly int MipBiasId      = Shader.PropertyToID("_MipBias");
     static readonly int ConvergenceId  = Shader.PropertyToID("_Convergence");
+    static readonly int FillMap0Id     = Shader.PropertyToID("_FillMap0");
+    static readonly int FillMap1Id     = Shader.PropertyToID("_FillMap1");
+    static readonly int FillMapSizeId  = Shader.PropertyToID("_FillMapSize");
+    static readonly int FillMirrorId   = Shader.PropertyToID("_FillMirror");
 
     readonly List<string> files = new List<string>();
     int index;
@@ -177,6 +307,14 @@ public class VR180Viewer : MonoBehaviour
     RenderTexture holdTex;   // 1x1: the previous photo's average colour, shown while the next loads
     PhotoInfo currentInfo;
     Quaternion imageToWorld = Quaternion.identity;
+    bool centredOnce;              // the first photo sets "straight ahead"; later ones keep it
+    float recentreAt = -1f;        // a pending recentre after the headset recentred (its time)
+    readonly List<UnityEngine.XR.XRInputSubsystem> inputSubsystems = new List<UnityEngine.XR.XRInputSubsystem>();
+
+    // The soft fill's pole-free copies of the photo (see VR180/StereoEquirect), one per eye
+    const int FillMapSize = 1024;
+    readonly RenderTexture[] fillMaps = new RenderTexture[2];
+    Material fillBakeMaterial;
 
     TexturesExtension layerTextures, layerTexturesRight;
     Material extractMaterial;
@@ -198,37 +336,84 @@ public class VR180Viewer : MonoBehaviour
     VR180LoadingIndicator loading;
     VR180FavouriteBadge badge;
     bool viewingFavourites;   // the Favourites slideshow: no star as each one loads
+    bool shufflingFavourites; // ... in shuffled order (see Shuffle Favourites)
+    bool sessionLost;         // the XR session ended (headset asleep): rebuild the layer when it's back
     VR180Adjustments.Values adjust = VR180Adjustments.Values.Default;   // the current photo's (set from Get on each load)
     VR180Adjustments.Values adjustBeforePanel;
     float mipBias, mipBiasBeforePanel, materialMipBias;
 
     // Roll compensation (experimental): turns the photo about the line of sight so its stereo
-    // baseline follows the eyes' when the head rolls (or when looking off-centre), removing
-    // vertical mismatch between the eyes at the cost of the photo no longer staying level.
-    // 0 = off (world-steady), 1 = full. One setting for all photos.
+    // baseline follows the eyes', removing vertical mismatch between the eyes at the cost of the
+    // photo no longer staying level. Only when looking down and to the side (see the Inspector's
+    // roll settings), where the mismatch is worst and the horizon is out of view anyway; elsewhere
+    // the photo stays level. rollStrength (the panel's slider, one setting for all photos) is the
+    // strength at the edge of that zone and beyond: 0 = off, 1 = full.
     float rollStrength, rollBeforePanel;
     Quaternion viewRoll = Quaternion.identity;   // this frame's extra rotation about the gaze
     const string RollKey = "VR180.rollCompensation";
+
+    // Head-turn parallax (experimental): turning the head moves the eyes (they're in front of the
+    // neck's pivot), but a photo at infinity doesn't move with them, so near things seem to swing
+    // round with the head. With a distance set, the photo is put on a sphere of that radius, centred
+    // where each eye would be with the head facing the photo's centre, so things at that distance
+    // stay put. Only the head's turning counts: leaning or walking still carries the photo along.
+    float parallaxDistance, parallaxBeforePanel;   // metres; 0 = off
+    Vector3 parallaxOffset;                        // this frame's eye displacement from turning the head (world)
+    bool eyeSourceLogged;
+    const string ParallaxKey = "VR180.parallaxDistance";
+    static readonly int ParallaxId = Shader.PropertyToID("_Parallax");
+
+    // Zoom: longitude and latitude scaled by zoom about zoomCentre (photo frame, radians), on the
+    // sphere (shader) and on the layer (a cropped part of its image over scaled angles)
+    float zoom = 1f;
+    Vector2 zoomCentre;
+    bool zoomPaused;     // stopped at 1x on the way through, until the stick is let go
+    bool zoomChanging;   // for logging the result when the stick is let go
+    static readonly int ZoomId = Shader.PropertyToID("_Zoom");
     const string MipBiasKey = "VR180.mipBias";
 
     /// True on the Quest itself; false on PC (Link, Air Link) and in the Editor
     public static bool OnQuest => Application.platform == RuntimePlatform.Android;
 
-    struct PhotoInfo
+    internal struct PhotoInfo
     {
         public Vector4 coverage;   // lonMin, lonMax, latMin, latMax in radians
         public bool sideBySide;
         public bool fisheye;            // an unprocessed QooCam photo, converted as it's used
         public VR180Fisheye.Raw raw;
+        public Vector3 baseline;        // the camera's left-right axis in the photo's frame (x, unless levelling tilted it)
+        public Quaternion tilt;         // photo's frame -> level frame: a raw (or tagged Studio) photo levelled by turning the sphere, else identity
     }
+
+    /// The current photo's levelling turn (photo's frame -> level frame); identity for most photos
+    Quaternion PhotoTilt => currentInfo.tilt.w == 0f && currentInfo.tilt.x == 0f && currentInfo.tilt.y == 0f && currentInfo.tilt.z == 0f
+        ? Quaternion.identity : currentInfo.tilt;
+
+    /// Photo's frame -> world: the yaw that puts it ahead of you, then (raw photos) its levelling turn
+    Quaternion Display => imageToWorld * PhotoTilt;
 
     // ------------------------------------------------------------------ lifecycle
 
-    void OnValidate() => VR180Fisheye.Levelling = levelFisheyePhotos;
+    void OnValidate()
+    {
+        UIScale = uiScale;
+        VR180Thumbnails.FlipY = flipThumbnails;
+        VR180PhotoPicker.StereoThumbnails = stereoThumbnails;
+        VR180PhotoPicker.ThumbnailDepth = thumbnailDepth;
+        VR180Fisheye.Levelling = levelFisheyePhotos;
+        VR180Fisheye.LensPatch = lensPatch;
+        VR180Fisheye.LevelBySphere = levelByTurningSphere;
+    }
 
     void Awake()
     {
+        UIScale = uiScale;
+        VR180Thumbnails.FlipY = flipThumbnails;
+        VR180PhotoPicker.StereoThumbnails = stereoThumbnails;
+        VR180PhotoPicker.ThumbnailDepth = thumbnailDepth;
         VR180Fisheye.Levelling = levelFisheyePhotos;
+        VR180Fisheye.LensPatch = lensPatch;
+        VR180Fisheye.LevelBySphere = levelByTurningSphere;
         // On PC the layer can't show stereo VR180 (see Layer On PC), so leave it out entirely
         if (!OnQuest && !layerOnPC && photoLayer != null)
         {
@@ -236,6 +421,13 @@ public class VR180Viewer : MonoBehaviour
             if (photoLayerRight != null) photoLayerRight.gameObject.SetActive(false);
             photoLayer = photoLayerRight = null;
             Debug.Log("VR180Viewer: running on PC, so the compositor layer is off; photos show on the sphere at full resolution");
+        }
+        // On PC the eye images are what limit sharpness, so render them larger (see PC Render Scale)
+        if (!OnQuest && pcRenderScale > 1.001f && GraphicsSettings.currentRenderPipeline is UniversalRenderPipelineAsset urp)
+        {
+            savedRenderScale = urp.renderScale;
+            urp.renderScale = Mathf.Clamp(pcRenderScale, 1f, 2f);
+            Debug.Log($"VR180Viewer: PC render scale {urp.renderScale:F2} (the URP asset's own {savedRenderScale:F2} is put back on exit)");
         }
 
         nextAction = new InputAction("Next", InputActionType.Button);
@@ -249,7 +441,7 @@ public class VR180Viewer : MonoBehaviour
         navAction.AddBinding("<XRController>{RightHand}/{Primary2DAxis}");
 
         adjustAction = new InputAction("Adjust", InputActionType.Button);
-        adjustAction.AddBinding("<XRController>{RightHand}/{PrimaryButton}");
+        adjustAction.AddBinding("<XRController>{RightHand}/{SecondaryButton}");   // B
         adjustAction.AddBinding("<Keyboard>/a");
 
         favouriteAction = new InputAction("Favourite", InputActionType.Button);
@@ -263,7 +455,7 @@ public class VR180Viewer : MonoBehaviour
         stickClickAction.AddBinding("<XRController>{RightHand}/{Primary2DAxisClick}");
 
         menuAction = new InputAction("Menu", InputActionType.Button);
-        menuAction.AddBinding("<XRController>{RightHand}/{SecondaryButton}");   // B
+        menuAction.AddBinding("<XRController>{RightHand}/{PrimaryButton}");   // A
         menuAction.AddBinding("<Keyboard>/m");
 
         toggleLayerAction = new InputAction("ToggleLayer", InputActionType.Button);
@@ -329,6 +521,9 @@ public class VR180Viewer : MonoBehaviour
 
     void OnDestroy()
     {
+        // Put the URP asset's render scale back (in the Editor, runtime changes to it are saved)
+        if (savedRenderScale > 0f && GraphicsSettings.currentRenderPipeline is UniversalRenderPipelineAsset urp)
+            urp.renderScale = savedRenderScale;
         nextAction.Dispose();
         prevAction.Dispose();
         recentreAction.Dispose();
@@ -345,16 +540,25 @@ public class VR180Viewer : MonoBehaviour
         {
             viewerMaterial.SetTexture(MainTexId, null);
             viewerMaterial.SetTexture(HoldTexId, null);
+            viewerMaterial.SetTexture(FillMap0Id, null);
+            viewerMaterial.SetTexture(FillMap1Id, null);
+            viewerMaterial.SetFloat(FillMapSizeId, 0f);
             viewerMaterial.SetFloat(LayerModeId, 0f);
             viewerMaterial.SetFloat(BlurId, 0f);
             viewerMaterial.SetFloat(HoldMixId, 0f);
             viewerMaterial.SetFloat(FadeId, 1f);
             // Leave the material asset as it was (in the Editor, runtime changes to it are saved)
             ApplyAdjust(viewerMaterial, VR180Adjustments.Values.Default);
+            viewerMaterial.SetVector(ParallaxId, Vector4.zero);
+            viewerMaterial.SetVector(ZoomId, new Vector4(1f, 0f, 0f, 0f));
             if (head != null) viewerMaterial.SetFloat(MipBiasId, materialMipBias);
         }
         if (holdTex != null) { holdTex.Release(); Destroy(holdTex); }
         if (current != null) { current.Release(); Destroy(current); }
+        foreach (var m in fillMaps) if (m != null) { m.Release(); Destroy(m); }
+        if (fillBakeMaterial != null) Destroy(fillBakeMaterial);
+        foreach (var sub in inputSubsystems) if (sub != null) sub.trackingOriginUpdated -= OnTrackingOriginUpdated;
+        VR180StereoEquirectHandler.SessionStopped -= OnXRSessionStopped;
     }
 
     IEnumerator Start()
@@ -375,12 +579,15 @@ public class VR180Viewer : MonoBehaviour
         Graphics.Blit(Texture2D.blackTexture, holdTex);
         viewerMaterial.SetTexture(HoldTexId, holdTex);
         viewerMaterial.SetFloat(LayerModeId, 0f);
+        viewerMaterial.SetFloat(FillMapSizeId, 0f);   // until the first photo's fill maps are made
         Recentre();
+        WatchHeadsetRecentre();
 
         // Sharpness (mip bias) is one setting for all photos, remembered between sessions
         materialMipBias = viewerMaterial.GetFloat(MipBiasId);
         mipBias = PlayerPrefs.GetFloat(MipBiasKey, materialMipBias);
-        rollStrength = PlayerPrefs.GetFloat(RollKey, 0f);
+        rollStrength = PlayerPrefs.GetFloat(RollKey, 0.7f);
+        parallaxDistance = PlayerPrefs.GetFloat(ParallaxKey, 0f);
         viewerMaterial.SetFloat(MipBiasId, mipBias);
         ApplyAdjust(viewerMaterial, adjust);
 
@@ -392,13 +599,17 @@ public class VR180Viewer : MonoBehaviour
         badge.Init(head);
         notice = gameObject.AddComponent<VR180Notice>();
         notice.Init(head);
+        tiltHint = gameObject.AddComponent<VR180TiltHint>();
+        tiltHint.Init(head);
 
         Debug.Log($"VR180Viewer: running on {(OnQuest ? "the Quest" : "PC")}; max texture size on this device is {SystemInfo.maxTextureSize}, " +
                   $"system memory {SystemInfo.systemMemorySize} MB, graphics memory {SystemInfo.graphicsMemorySize} MB");
         Application.lowMemory += () => Debug.LogWarning("VR180Viewer: the system says memory is running low");
 
+        gameObject.AddComponent<VR180Thumbnails>();
         picker = gameObject.AddComponent<VR180PhotoPicker>();
         picker.Init(this, PhotoRoot);
+        VR180StereoEquirectHandler.SessionStopped += OnXRSessionStopped;
 
         string flatFolder = Application.platform == RuntimePlatform.Android
             ? questFlatFolder
@@ -442,7 +653,7 @@ public class VR180Viewer : MonoBehaviour
     public string CurrentPhotoPath => files.Count > 0 ? files[index] : null;
     public Vector4 CurrentCoverage => currentInfo.coverage;
     public bool CurrentSideBySide => currentInfo.sideBySide;
-    public Quaternion ImageToWorld => imageToWorld;
+    public Quaternion ImageToWorld => Display;   // photo's frame -> world, including a raw photo's levelling turn
     public bool CanStartFraming => !busy && !framing && current != null && files.Count > 0 &&
                                    (picker == null || !picker.IsOpen) && (adjustPanel == null || !adjustPanel.IsOpen);
     public VR180Adjustments.Values CurrentAdjustments => adjust;
@@ -451,7 +662,7 @@ public class VR180Viewer : MonoBehaviour
     public void SetFraming(bool on)
     {
         framing = on;
-        if (on) HideLayer();
+        if (on) { ResetZoom(); HideLayer(); }
         else if (useLayer && LayerReady) ShowLayer();
     }
 
@@ -463,7 +674,7 @@ public class VR180Viewer : MonoBehaviour
         if (adjustPanel != null && adjustPanel.IsOpen) return;
         HideLayer();   // the photo layer draws over everything, including the picker
         StartCoroutine(Animate(BlurId, Mathf.Max(pickerBackdropBlur, viewerMaterial.GetFloat(BlurId)), 0.3f));
-        picker.Open(currentFolder, head);
+        picker.Open(currentFolder, head, files.Count > 0 ? files[index] : null);
         Debug.Log("VR180Viewer [picker]: opened");
     }
 
@@ -483,8 +694,9 @@ public class VR180Viewer : MonoBehaviour
         if (useLayer && LayerReady && files.Count > 0) ShowLayer();
     }
 
-    /// Called by the picker: show the photos in a folder, starting from the first.
-    public void LoadFolder(string folder)
+    /// Called by the picker: show the photos in a folder, starting from the first, or from startAt
+    /// (a photo's full path) if it's one of them.
+    public void LoadFolder(string folder, string startAt = null)
     {
         if (busy) return;
         if (picker != null) picker.Close();
@@ -496,10 +708,12 @@ public class VR180Viewer : MonoBehaviour
         }
         currentFolder = folder;
         viewingFavourites = false;
+        shufflingFavourites = false;
         PlayerPrefs.SetString(LastFolderKey, folder);
         PlayerPrefs.Save();
-        Debug.Log($"VR180Viewer [picker]: showing {files.Count} photo(s) from {folder}");
-        StartCoroutine(Show(0));
+        int start = startAt == null ? 0 : Mathf.Max(0, files.FindIndex(f => SamePath(f, startAt)));
+        Debug.Log($"VR180Viewer [picker]: showing {files.Count} photo(s) from {folder}, starting at {Path.GetFileName(files[start])}");
+        StartCoroutine(Show(start));
     }
 
     // Diagnostic: reports which physical control triggered each action
@@ -512,6 +726,13 @@ public class VR180Viewer : MonoBehaviour
     void Update()
     {
         UpdateView();
+        CheckWake();
+        if (recentreAt >= 0f && Time.unscaledTime >= recentreAt)
+        {
+            recentreAt = -1f;
+            Recentre();
+            Debug.Log("VR180Viewer: the headset recentred, so the photo has too");
+        }
 
         LogPress(nextAction);
         LogPress(prevAction);
@@ -525,7 +746,7 @@ public class VR180Viewer : MonoBehaviour
         // While framing a flat export, the export owns the controls
         if (framing) return;
 
-        // While the adjustments panel is open, the trigger and ray are for its sliders; A closes it
+        // While the adjustments panel is open, the trigger and ray are for its sliders; B closes it
         if (adjustPanel != null && adjustPanel.IsOpen)
         {
             if (adjustAction.WasPressedThisFrame()) CloseAdjustments();
@@ -541,6 +762,13 @@ public class VR180Viewer : MonoBehaviour
             menuPressTime = Time.unscaledTime;
             menuHoldHandled = false;
         }
+        // Editor: T switches the zoom style (to compare the two)
+        if ((picker == null || !picker.IsOpen) && Keyboard.current != null && Keyboard.current.tKey.wasPressedThisFrame)
+        {
+            zoomStyle = zoomStyle == ZoomStyle.Map ? ZoomStyle.Telephoto : ZoomStyle.Map;
+            badge.Buzz(zoomStyle == ZoomStyle.Telephoto);
+            Debug.Log($"VR180Viewer [zoom]: style {zoomStyle}" + (zoom != 1f ? $" at {zoom:F2}x" : ""));
+        }
         if (stickClickAction.IsPressed() && !menuHoldHandled && Time.unscaledTime - menuPressTime > 0.6f)
         {
             menuHoldHandled = true;
@@ -548,24 +776,43 @@ public class VR180Viewer : MonoBehaviour
             Debug.Log("VR180Viewer: recentred");
         }
 
-        // B opens or closes the picker
+        // A opens or closes the picker
         if (menuAction.WasPressedThisFrame())
         {
             if (picker != null && picker.IsOpen) ClosePicker();
             else OpenPicker();
         }
 
-        // While the picker is open, the trigger and ray are for the picker; nothing else applies
-        if (picker != null && picker.IsOpen) return;
+        // While the picker is open, the trigger and ray are for the picker, and either thumbstick
+        // scrolls it; nothing else applies
+        if (picker != null && picker.IsOpen)
+        {
+            picker.Scroll(navAction.ReadValue<Vector2>());
+            return;
+        }
 
-        if (toggleLayerAction.WasPressedThisFrame() && !busy && LayerReady)
+        if (toggleLayerAction.WasPressedThisFrame() && photoLayer != null && zoom != 1f)
+        {
+            // While zoomed, X switches the layer filter experiment instead (compare at 2x)
+            layerFilterOn = !layerFilterOn;
+            badge.Buzz(layerFilterOn);
+            Debug.Log($"VR180Viewer [zoom]: layer filter {(layerFilterOn ? layerFilter.ToString() : "off")} at {zoom:F2}x" +
+                      (VR180StereoEquirectHandler.SettingsSupported ? "" : " (but the runtime hasn't enabled the extension)"));
+        }
+        else if (toggleLayerAction.WasPressedThisFrame() && !busy && LayerReady)
         {
             useLayer = !useLayer;
             if (useLayer) ShowLayer(); else HideLayer();
             Debug.Log($"VR180Viewer: compositor layer {(useLayer ? "on" : "off")}");
         }
 
-        if (toggleRadiusAction.WasPressedThisFrame() && photoLayer != null)
+        if (toggleRadiusAction.WasPressedThisFrame() && photoLayer != null && zoom != 1f)
+        {
+            // While zoomed, Y flips the layer's crop instead (diagnostic, see Zoom Crop Flip Y)
+            zoomCropFlipY = !zoomCropFlipY;
+            Debug.Log($"VR180Viewer [zoom]: crop flip {(zoomCropFlipY ? "on" : "off")}");
+        }
+        else if (toggleRadiusAction.WasPressedThisFrame() && photoLayer != null)
         {
             // Swap between the Inspector's radius and 0 (infinitely far), applied immediately
             float other = inspectorLayerRadius > 0f ? inspectorLayerRadius : 50f;
@@ -590,6 +837,7 @@ public class VR180Viewer : MonoBehaviour
         }
 
         if (busy || files.Count == 0) return;
+        if (current != null) UpdateZoom(stick);
         if (adjustAction.WasPressedThisFrame() && current != null) OpenAdjustments();
         else if (favouriteAction.WasPressedThisFrame() && current != null) ToggleFavourite();
         else if (step > 0 || nextAction.WasPressedThisFrame()) StartCoroutine(Show(index + 1));
@@ -610,13 +858,23 @@ public class VR180Viewer : MonoBehaviour
         if (rollStrength > 0f && currentInfo.sideBySide)
         {
             Vector3 gaze = head.forward;   // no eye tracking on the Quest 3, so the head's direction
-            // The photo's left-right direction (its stereo baseline) and the eyes', both as seen
+
+            // Only looking down and to the side: how far below the horizon, and how far round from
+            // the photo's centre (imageToWorld only turns about the vertical, so this is level)
+            Vector3 g = Quaternion.Inverse(imageToWorld) * gaze;
+            float down = -Mathf.Asin(Mathf.Clamp(g.y, -1f, 1f)) * Mathf.Rad2Deg;
+            float centreLon = (currentInfo.coverage.x + currentInfo.coverage.y) * 0.5f * Mathf.Rad2Deg;
+            float side = Mathf.Abs(Mathf.DeltaAngle(centreLon, Mathf.Atan2(g.x, g.z) * Mathf.Rad2Deg));
+            float zone = Ramp(down, rollDownStart, rollDownFull) * Ramp(side, rollSideStart, rollSideFull);
+
+            // The camera's left-right direction (its stereo baseline) and the eyes', both as seen
             // looking along the gaze
-            Vector3 photoAcross = Vector3.ProjectOnPlane(imageToWorld * Vector3.right, gaze);
+            Vector3 baseline = currentInfo.baseline.sqrMagnitude > 0.5f ? currentInfo.baseline : Vector3.right;
+            Vector3 photoAcross = Vector3.ProjectOnPlane(Display * baseline, gaze);
             Vector3 eyesAcross = Vector3.ProjectOnPlane(head.right, gaze);
             // Looking far to the side, the photo has little stereo left and the angle becomes
             // unreliable, so the correction fades out there
-            float weight = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(0.2f, 0.5f, photoAcross.magnitude));
+            float weight = zone * Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(0.2f, 0.5f, photoAcross.magnitude));
             if (weight > 0f && eyesAcross.sqrMagnitude > 1e-6f)
             {
                 float angle = Mathf.Clamp(Vector3.SignedAngle(photoAcross, eyesAcross, gaze), -45f, 45f);
@@ -624,9 +882,209 @@ public class VR180Viewer : MonoBehaviour
             }
         }
 
-        viewerMaterial.SetMatrix(WorldToImageId, Matrix4x4.Rotate(Quaternion.Inverse(viewRoll * imageToWorld)));
+        // Head-turn parallax: how far turning the head (from facing the photo's centre) has moved the eyes
+        parallaxOffset = parallaxDistance > 0f ? head.rotation * neckToEyes - imageToWorld * neckToEyes : Vector3.zero;
+        viewerMaterial.SetVector(ParallaxId, new Vector4(parallaxOffset.x, parallaxOffset.y, parallaxOffset.z, parallaxDistance));
+
+        viewerMaterial.SetVector(ZoomId, new Vector4(zoom, zoomCentre.x, zoomCentre.y, Telephoto ? 1f : 0f));
+        viewerMaterial.SetMatrix(WorldToImageId, Matrix4x4.Rotate(Quaternion.Inverse(viewRoll * Display)));
+        UpdateTelephotoLayer();
         if (photoLayer != null && photoLayer.gameObject.activeSelf) UpdateLayerPose();
+        viewerMaterial.SetFloat(FillMapSizeId, useFillMaps && fillMaps[0] != null ? FillMapSize : 0f);
     }
+
+    // ------------------------------------------------------------------ zoom
+
+    /// Zoomed in with the telephoto style (zooming out always uses the map style)
+    bool Telephoto => zoomStyle == ZoomStyle.Telephoto && zoom > 1f;
+
+    /// Whether the layer's image holds the view wanted now: the telephoto zoom baked in, or none
+    bool LayerBakeMatches => Telephoto
+        ? layerBakeZoom == zoom && layerBakeCentre == zoomCentre
+        : layerBakeZoom == 1f;
+
+    // The Quest's equirect layer can only zoom in the map style. For a telephoto zoom, the layer
+    // steps aside while the zoom changes (the sphere shows it, softer: its copy is reduced on the
+    // Quest); once the zoom has settled, the layer is rebuilt with the zoom baked into its image
+    // (RebuildLayer: a re-decode, about 2.5 s). Back at 1x it's rebuilt plain the same way.
+    void UpdateTelephotoLayer()
+    {
+        if (photoLayer == null) return;
+        if (StereoLayers)
+        {
+            if (!LayerBakeMatches && photoLayer.gameObject.activeSelf)
+            {
+                HideLayer();
+                telephotoHidLayer = true;
+            }
+            if (telephotoHidLayer && !busy && !PanelOpen && !zoomChanging && current != null && files.Count > 0 &&
+                Time.unscaledTime - lastZoomTime > zoomSettleSeconds)
+            {
+                telephotoHidLayer = false;
+                if (!useLayer) return;
+                if (LayerBakeMatches) { if (LayerReady) ShowLayer(); }
+                else
+                {
+                    Debug.Log($"VR180Viewer [zoom]: rebuilding the layer {(Telephoto ? $"with the {zoom:F2}x telephoto zoom" : "unzoomed")}");
+                    StartCoroutine(RebuildLayer());
+                }
+            }
+            return;
+        }
+        // (One layer for both eyes, Unity's handler: no baking; it just steps aside while zoomed in)
+        if (Telephoto && !busy && !PanelOpen)
+        {
+            if (photoLayer.gameObject.activeSelf)
+            {
+                HideLayer();
+                telephotoHidLayer = true;
+                Debug.Log("VR180Viewer [zoom]: telephoto zoom, so the layer steps aside (the sphere is softer on the Quest)");
+            }
+        }
+        else if (telephotoHidLayer && !Telephoto && !busy && !PanelOpen)
+        {
+            telephotoHidLayer = false;
+            if (useLayer && LayerReady) ShowLayer();
+        }
+    }
+
+    // Thumbstick up = in, down = out, at a rate set by how far it's pushed. Starting from 1x, the
+    // zoom centres on where you're looking left/right, and on the horizon up/down (see Zoom Vertical
+    // Follow); it stays there (so the photo stays steady in space as
+    // you look around) until the zoom is back to 1x.
+    void UpdateZoom(Vector2 stick)
+    {
+        float y = stick.y;
+        if (Mathf.Abs(y) < 0.35f || Mathf.Abs(y) < Mathf.Abs(stick.x))
+        {
+            zoomPaused = false;
+            if (zoomChanging)
+            {
+                zoomChanging = false;
+                Debug.Log($"VR180Viewer [zoom]: {zoom:F2}x{(Telephoto ? " telephoto" : zoom != 1f ? " map" : "")}" + (zoom != 1f
+                    ? $" about {zoomCentre.x * Mathf.Rad2Deg:F0} deg across, {zoomCentre.y * Mathf.Rad2Deg:F0} deg up" : ""));
+            }
+            return;
+        }
+        if (zoomPaused) return;
+
+        if (zoom == 1f)
+        {
+            // Where you're looking left/right, but vertically only part way from the horizon to the
+            // gaze (none by default), so the horizon stays straight; worked out level, then turned
+            // into the photo's frame (which differs only for a raw photo levelled by the sphere)
+            Vector3 gl = Quaternion.Inverse(imageToWorld) * head.forward;
+            float az = Mathf.Atan2(gl.x, gl.z);
+            // (A telephoto zoom keeps the horizon straight wherever it's centred, so it centres
+            // exactly where you look)
+            float follow = zoomStyle == ZoomStyle.Telephoto && y > 0f ? 1f : zoomVerticalFollow;
+            float el = follow * Mathf.Asin(Mathf.Clamp(gl.y, -1f, 1f));
+            Vector3 g = Quaternion.Inverse(PhotoTilt) * new Vector3(Mathf.Sin(az) * Mathf.Cos(el), Mathf.Sin(el), Mathf.Cos(az) * Mathf.Cos(el));
+            Vector4 c = currentInfo.coverage;
+            zoomCentre = new Vector2(Mathf.Clamp(Mathf.Atan2(g.x, g.z), c.x, c.y),
+                                     Mathf.Clamp(Mathf.Asin(Mathf.Clamp(g.y, -1f, 1f)), c.z, c.w));
+        }
+        float rate = Mathf.Sign(y) * (Mathf.Abs(y) - 0.35f) / 0.65f;
+        float next = Mathf.Clamp(zoom * Mathf.Pow(2f, rate * zoomSpeed * Time.unscaledDeltaTime), zoomMin, zoomMax);
+        if ((zoom > 1f && next <= 1f) || (zoom < 1f && next >= 1f))
+        {
+            next = 1f;
+            zoomPaused = true;
+        }
+        zoom = next;
+        zoomChanging = true;
+        lastZoomTime = Time.unscaledTime;
+    }
+
+    void ResetZoom()
+    {
+        zoom = 1f;
+        zoomPaused = zoomChanging = false;
+        telephotoHidLayer = false;   // whoever resets the zoom also decides about the layer
+    }
+
+    static ulong LayerFilterFlags(LayerFilter f)
+    {
+        const ulong ss = VR180StereoEquirectHandler.NormalSuperSampling, qss = VR180StereoEquirectHandler.QualitySuperSampling;
+        const ulong sh = VR180StereoEquirectHandler.NormalSharpening, qsh = VR180StereoEquirectHandler.QualitySharpening;
+        switch (f)
+        {
+            case LayerFilter.Sharpen: return sh;
+            case LayerFilter.QualitySharpen: return qsh;
+            case LayerFilter.SuperSample: return ss;
+            case LayerFilter.QualitySuperSample: return qss;
+            case LayerFilter.SharpenAndSuperSample: return sh | ss;
+            case LayerFilter.QualityBoth: return qsh | qss;
+            default: return 0;
+        }
+    }
+
+    /// The layer's view of the zoomed photo: which part of its image (x from the left, y from the top,
+    /// 0..1), over which angles (radians), and the longitude (degrees) of that part's centre as shown
+    void ZoomedLayerView(out Rect crop, out float central, out float upper, out float lower, out float centreDeg)
+    {
+        const float H = Mathf.PI / 2f;
+        Vector4 c = currentInfo.coverage;
+        float m = zoom, gl = zoomCentre.x, gp = zoomCentre.y;
+        // The part of the photo that fits: at most all the way round, and up to the poles, once scaled
+        float l0 = Mathf.Max(c.x, gl - Mathf.PI / m), l1 = Mathf.Min(c.y, gl + Mathf.PI / m);
+        float p0 = Mathf.Max(c.z, gp + (-H - gp) / m), p1 = Mathf.Min(c.w, gp + (H - gp) / m);
+        float d0 = gl + m * (l0 - gl), d1 = gl + m * (l1 - gl);
+        central = Mathf.Min(d1 - d0, 2f * Mathf.PI - 1e-4f);
+        centreDeg = (d0 + d1) * 0.5f * Mathf.Rad2Deg;
+        upper = Mathf.Min(gp + m * (p1 - gp), H);
+        lower = Mathf.Max(gp + m * (p0 - gp), -H);
+        float w = c.y - c.x, h = c.w - c.z;
+        crop = Rect.MinMaxRect((l0 - c.x) / w, (c.w - p1) / h, (l1 - c.x) / w, (c.w - p0) / h);
+    }
+
+    /// Called by the adjustments panel's slider (metres, 0 = off); takes effect at once
+    public void SetParallaxDistance(float metres) => parallaxDistance = metres > 0f ? Mathf.Max(metres, 0.5f) : 0f;
+
+    /// The layers' radius: the parallax distance when that's on, otherwise the Inspector's (normally 0, infinite)
+    float EffectiveLayerRadius => parallaxDistance > 0f ? parallaxDistance : layerRadius;
+
+    static void SetLayerRadius(CompositionLayer layer, float r)
+    {
+        if (layer != null && layer.LayerData is EquirectMeshLayerData data && !Mathf.Approximately(data.Radius, r)) data.Radius = r;
+    }
+
+    /// Where the two eyes are (world space): from the headset if it says, else 63 mm apart either side of the head
+    void EyePositions(out Vector3 left, out Vector3 right)
+    {
+        var device = UnityEngine.XR.InputDevices.GetDeviceAtXRNode(UnityEngine.XR.XRNode.CenterEye);
+        if (device.isValid &&
+            device.TryGetFeatureValue(UnityEngine.XR.CommonUsages.leftEyePosition, out Vector3 l) &&
+            device.TryGetFeatureValue(UnityEngine.XR.CommonUsages.rightEyePosition, out Vector3 r) &&
+            (l - r).sqrMagnitude > 1e-6f)
+        {
+            // Tracking space -> world: the camera's parent is the XR Origin's camera offset
+            Transform space = head.parent;
+            left = space != null ? space.TransformPoint(l) : l;
+            right = space != null ? space.TransformPoint(r) : r;
+            // A sanity check: their midpoint should be the head (the camera)
+            if (((left + right) * 0.5f - head.position).sqrMagnitude < 0.05f * 0.05f)
+            {
+                if (!eyeSourceLogged)
+                {
+                    eyeSourceLogged = true;
+                    Debug.Log($"VR180Viewer [parallax]: eye positions from the headset, {Vector3.Distance(left, right) * 1000f:F1} mm apart");
+                }
+                return;
+            }
+        }
+        if (!eyeSourceLogged)
+        {
+            eyeSourceLogged = true;
+            Debug.Log("VR180Viewer [parallax]: the headset gave no usable eye positions; assuming 63 mm apart");
+        }
+        left = head.position - head.right * 0.0315f;
+        right = head.position + head.right * 0.0315f;
+    }
+
+    /// 0 below a, 1 above b, a smooth S-curve between (b may be below a, for a falling ramp)
+    static float Ramp(float x, float a, float b) =>
+        Mathf.Approximately(a, b) ? (x >= b ? 1f : 0f) : Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(a, b, x));
 
     // ------------------------------------------------------------------ favourites
 
@@ -659,11 +1117,15 @@ public class VR180Viewer : MonoBehaviour
         }
         if (picker != null) picker.Close();
         files.Clear();
-        files.AddRange(favs);
+        int start = 0;
+        shufflingFavourites = ShuffleFavourites;
+        if (shufflingFavourites) files.AddRange(ShuffledFavourites(favs, out start));
+        else files.AddRange(favs);
         currentFolder = null;   // the picker opens at its root next time
         viewingFavourites = true;
-        Debug.Log($"VR180Viewer [favourites]: showing {files.Count} favourite(s)");
-        StartCoroutine(Show(0));
+        Debug.Log($"VR180Viewer [favourites]: showing {files.Count} favourite(s)" +
+                  (shufflingFavourites ? $", shuffled, from number {start + 1}" : ""));
+        StartCoroutine(Show(start));
     }
 
     /// Called by the picker after deleting photos, so the list being viewed doesn't include them
@@ -689,7 +1151,16 @@ public class VR180Viewer : MonoBehaviour
         adjustBeforePanel = adjust;
         mipBiasBeforePanel = mipBias;
         rollBeforePanel = rollStrength;
-        adjustPanel.Open(head, Path.GetFileName(files[index]), adjust, mipBias, VR180Favourites.IsFavourite(files[index]), rollStrength);
+        parallaxBeforePanel = parallaxDistance;
+        // QooCam photos with a gravity reading (raw ones, and Studio's with the reading copied back in)
+        // can have their levelling switched off
+        string tilt = null;
+        if (currentInfo.raw.hasGravity && VR180Fisheye.Levelling)
+        {
+            VR180Fisheye.Tilt(currentInfo.raw, out float pitch, out float roll);
+            tilt = $"camera {Mathf.Abs(pitch):0.0}\u00b0 {(pitch >= 0f ? "up" : "down")}, {Mathf.Abs(roll):0.0}\u00b0 {(roll >= 0f ? "right" : "left")}";
+        }
+        adjustPanel.Open(head, Path.GetFileName(files[index]), adjust, mipBias, VR180Favourites.IsFavourite(files[index]), rollStrength, parallaxDistance, tilt);
         Debug.Log("VR180Viewer [adjust]: opened");
     }
 
@@ -719,6 +1190,13 @@ public class VR180Viewer : MonoBehaviour
             PlayerPrefs.Save();
             Debug.Log($"VR180Viewer [adjust]: roll compensation now {rollStrength * 100f:0}%");
         }
+        if (Mathf.Abs(parallaxDistance - parallaxBeforePanel) > 0.001f)
+        {
+            PlayerPrefs.SetFloat(ParallaxKey, parallaxDistance);
+            PlayerPrefs.Save();
+            string what = parallaxDistance > 0f ? "at " + parallaxDistance.ToString("F1", CultureInfo.InvariantCulture) + " m" : "off";
+            Debug.Log($"VR180Viewer [adjust]: head-turn parallax {what}");
+        }
         // A photo following the default convergence sets the default for all such photos
         if (!adjust.ownConvergence && Mathf.Abs(adjust.convergence - VR180Adjustments.DefaultConvergence) > 0.001f)
         {
@@ -731,7 +1209,15 @@ public class VR180Viewer : MonoBehaviour
         if (changed && files.Count > 0) VR180Adjustments.Set(files[index], adjust);
         Debug.Log($"VR180Viewer [adjust]: closed; exposure {adjust.exposure:F2}, contrast {adjust.contrast:F2}, " +
                   $"saturation {adjust.saturation:F2}, convergence {adjust.convergence:F2} deg, mip bias {mipBias:F2}" +
-                  $"{(changed ? " (saved for this photo)" : "")}");
+                  $"{(adjust.keepTilt ? ", horizon not levelled" : "")}{(changed ? " (saved for this photo)" : "")}");
+
+        // Levelling is part of the raw photo's conversion (layer and sphere), so reload the photo
+        if (adjust.keepTilt != adjustBeforePanel.keepTilt && files.Count > 0)
+        {
+            Debug.Log($"VR180Viewer [adjust]: reloading to {(adjust.keepTilt ? "show the camera's tilt" : "level the horizon")}");
+            StartCoroutine(Show(index));
+            return;
+        }
 
         if (photoLayer == null || !useLayer) return;
         if (imageChanged) StartCoroutine(RebuildLayer());
@@ -773,15 +1259,149 @@ public class VR180Viewer : MonoBehaviour
         }
         yield return null;
         loading.Hide();
-        Debug.Log($"VR180Viewer [adjust]: layer rebuilt in {Time.realtimeSinceStartup - t0:F2}s");
-        if (useLayer) ShowLayer();
+        Debug.Log($"VR180Viewer [layer]: layer rebuilt in {Time.realtimeSinceStartup - t0:F2}s");
+        if (useLayer && !PanelOpen) ShowLayer();
         busy = false;
     }
 
     // Diagnostic: the Quest stops sending controller input to an app that has lost focus
     // (for example while a system Settings window is open)
     void OnApplicationFocus(bool focus) => Debug.Log($"VR180Viewer: application focus {(focus ? "gained" : "lost")}");
-    void OnApplicationPause(bool paused) => Debug.Log($"VR180Viewer: application {(paused ? "paused" : "resumed")}");
+    void OnApplicationPause(bool paused)
+    {
+        Debug.Log($"VR180Viewer: application {(paused ? "paused" : "resumed")}");
+        if (!paused) StartCoroutine(CheckLayerAfterResume());
+    }
+
+    bool PanelOpen => framing || (picker != null && picker.IsOpen) || (adjustPanel != null && adjustPanel.IsOpen);
+
+    // ------------------------------------------------------------------ waking from sleep
+
+    // When the headset sleeps, the XR session ends and the headset discards the layer's images. The
+    // full-size eye textures were freed once the layer held the photo, so nothing would refill it,
+    // and the sphere (drawing only the surround while the layer shows) would leave the view black.
+    // So: as soon as the session ends, let the sphere show the photo again; once the session is
+    // back, decode the photo again and rebuild the layer (about 2.5 s, with the loading dots).
+    void OnXRSessionStopped()
+    {
+        sessionLost = true;
+        HideLayer();
+        Debug.Log("VR180Viewer [layer]: the XR session ended (headset asleep?); the sphere shows the photo until the layer is rebuilt");
+    }
+
+    void CheckWake()
+    {
+        if (!sessionLost || !VR180StereoEquirectHandler.Active || busy || framing || current == null || files.Count == 0) return;
+        sessionLost = false;
+        RestoreLayer("the XR session restarted");
+    }
+
+    // A fallback in case the session events don't come: a little after resuming, check the layer
+    IEnumerator CheckLayerAfterResume()
+    {
+        yield return new WaitForSecondsRealtime(1.5f);
+        if (busy || current == null || files.Count == 0) yield break;
+        if (useLayer && StereoLayers && !LayerReady) RestoreLayer("resumed with the layer's image gone");
+    }
+
+    void RestoreLayer(string why)
+    {
+        if (!useLayer || photoLayer == null || layerTextures == null) return;
+        if (LayerReady)
+        {
+            // The eye textures were still held, so the layer refills itself
+            if (!PanelOpen) ShowLayer();
+            Debug.Log($"VR180Viewer [layer]: {why}; layer shown again");
+            return;
+        }
+        HideLayer();
+        Debug.Log($"VR180Viewer [layer]: {why}; rebuilding the layer");
+        StartCoroutine(RebuildLayer());
+    }
+
+    // ------------------------------------------------------------------ shuffled favourites
+
+    const string ShuffleKey = "VR180.shuffleFavourites";
+
+    /// The picker's Shuffle switch: the All favourites slideshow in a shuffled order that carries on
+    /// across sessions, with no repeats until every favourite has been shown
+    public static bool ShuffleFavourites
+    {
+        get => PlayerPrefs.GetInt(ShuffleKey, 0) == 1;
+        set { PlayerPrefs.SetInt(ShuffleKey, value ? 1 : 0); PlayerPrefs.Save(); }
+    }
+
+    [Serializable]
+    class ShuffleState
+    {
+        public List<string> order = new List<string>();
+        public int position = -1;   // the last one shown
+    }
+
+    static string ShuffleFile => Path.Combine(Application.persistentDataPath, "shuffle.json");
+    static readonly System.Random shuffleRandom = new System.Random();
+
+    static bool SamePath(string a, string b) =>
+        string.Equals(Path.GetFullPath(a), Path.GetFullPath(b), StringComparison.OrdinalIgnoreCase);
+
+    /// The favourites in the saved shuffled order (favourites added since go somewhere among the
+    /// ones still to come; removed ones drop out), and where to start: after the last one shown
+    static List<string> ShuffledFavourites(List<string> favs, out int start)
+    {
+        var state = new ShuffleState();
+        try { if (File.Exists(ShuffleFile)) state = JsonUtility.FromJson<ShuffleState>(File.ReadAllText(ShuffleFile)) ?? new ShuffleState(); }
+        catch (Exception e) { Debug.LogWarning($"VR180Viewer [favourites]: couldn't read the shuffle: {e.Message}"); }
+
+        var present = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string f in favs) present[Path.GetFullPath(f)] = f;
+
+        // Keep the saved order for favourites still there; note how many of them were already shown
+        var order = new List<string>();
+        int shown = 0;
+        for (int i = 0; i < state.order.Count; i++)
+        {
+            string full;
+            try { full = Path.GetFullPath(state.order[i]); } catch { continue; }
+            if (!present.TryGetValue(full, out string f) || order.Contains(f)) continue;
+            order.Add(f);
+            if (i <= state.position) shown = order.Count;
+        }
+        // New favourites (or a first shuffle): at random places among those still to come
+        var fresh = favs.Where(f => !order.Contains(f)).ToList();
+        Shuffle(fresh, null);
+        foreach (string f in fresh) order.Insert(shuffleRandom.Next(shown, order.Count + 1), f);
+
+        start = shown;
+        if (start >= order.Count)
+        {
+            // Everything had been shown: a new round
+            Shuffle(order, shown > 0 ? order[shown - 1] : null);
+            start = 0;
+        }
+        return order;
+    }
+
+    /// Shuffles in place; notFirst (the one just seen) won't come first
+    static void Shuffle(List<string> list, string notFirst)
+    {
+        for (int i = list.Count - 1; i > 0; i--)
+        {
+            int j = shuffleRandom.Next(i + 1);
+            (list[i], list[j]) = (list[j], list[i]);
+        }
+        if (notFirst != null && list.Count > 1 && list[0] == notFirst)
+        {
+            int j = 1 + shuffleRandom.Next(list.Count - 1);
+            (list[0], list[j]) = (list[j], list[0]);
+        }
+    }
+
+    void SaveShuffle(int position)
+    {
+        var state = new ShuffleState { order = new List<string>(files), position = position };
+        try { File.WriteAllText(ShuffleFile, JsonUtility.ToJson(state)); }
+        catch (Exception e) { Debug.LogWarning($"VR180Viewer [favourites]: couldn't save the shuffle: {e.Message}"); }
+    }
 
     void LateUpdate()
     {
@@ -794,13 +1414,18 @@ public class VR180Viewer : MonoBehaviour
     /// The photos the viewer can show in a folder, sorted by name.
     public static List<string> ListPhotos(string folder) =>
         Directory.GetFiles(folder)
-            .Where(f =>
-            {
-                string e = Path.GetExtension(f).ToLowerInvariant();
-                return e == ".jpg" || e == ".jpeg";
-            })
+            .Where(IsPhotoFile)
             .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
             .ToList();
+
+    /// A JPEG that is a photo: not the QooCam's own small previews (..._Thumbstitched.JPG), which the
+    /// camera import used to copy too
+    public static bool IsPhotoFile(string f)
+    {
+        string e = Path.GetExtension(f).ToLowerInvariant();
+        return (e == ".jpg" || e == ".jpeg") &&
+               Path.GetFileName(f).IndexOf("thumbstitched", StringComparison.OrdinalIgnoreCase) < 0;
+    }
 
     bool FindPhotos(string folder)
     {
@@ -821,8 +1446,17 @@ public class VR180Viewer : MonoBehaviour
     {
         busy = true;
         photoGeneration++;
+        // A shuffled favourites slideshow that has shown every photo: shuffle again and carry on
+        if (shufflingFavourites && i >= files.Count && files.Count > 1)
+        {
+            string last = files[index];
+            Shuffle(files, last);
+            i = 0;
+            Debug.Log($"VR180Viewer [favourites]: all {files.Count} shown; shuffled again");
+        }
         index = ((i % files.Count) + files.Count) % files.Count;
         string path = files[index];
+        if (shufflingFavourites) SaveShuffle(index);
 
         HideLayer();
         if (blurTransition)
@@ -840,6 +1474,7 @@ public class VR180Viewer : MonoBehaviour
         {
             yield return Fade(0f);
         }
+        ResetZoom();         // each photo starts unzoomed (the old one has blurred away by now)
         yield return null;   // make sure the held frame is on screen before the heavy work
 
         loading.Show();
@@ -864,7 +1499,7 @@ public class VR180Viewer : MonoBehaviour
                 yield break;
             }
             Texture2D src = DownloadHandlerTexture.GetContent(req);
-            if (currentInfo.fisheye && src.width != src.height * 2)
+            if (currentInfo.fisheye && !VR180Fisheye.PlausibleSize(src.width, src.height))
             {
                 Debug.LogWarning($"VR180Viewer: {Path.GetFileName(path)} looks like a raw fisheye photo but is {src.width}x{src.height}; showing it as it is");
                 currentInfo.fisheye = false;
@@ -878,6 +1513,7 @@ public class VR180Viewer : MonoBehaviour
             // (An unprocessed QooCam photo is converted on the way into both: no full-size converted copy)
             current = MakeMipmapped(src, layerWanted ? sphereHalvingsWithLayer : 0, currentInfo.fisheye, currentInfo.raw);
             Destroy(src);
+            BakeFillMaps();
         }
         yield return null;   // let the decoded photo's memory be freed before the layer starts up
         loading.Hide();
@@ -893,7 +1529,13 @@ public class VR180Viewer : MonoBehaviour
         viewerMaterial.SetVector(CoverageId, currentInfo.coverage);
         viewerMaterial.SetFloat(StereoId, currentInfo.sideBySide ? 1f : 0f);
         viewerMaterial.SetFloat(MaxMipId, Mathf.Floor(Mathf.Log(Mathf.Max(current.width, current.height), 2f)));
-        Recentre();
+        // Only the first photo is centred on where you're looking; after that every photo appears
+        // in the same place, and recentring is left to the headset (or the thumbstick hold)
+        if (!centredOnce) { Recentre(); centredOnce = true; }
+
+        // A photo whose centre is well above or below the horizon (and your gaze): a brief arrow
+        // that way, timed to finish within the sharpen-in (the layer covers it on the Quest)
+        ShowTiltHint(blurTransition ? colourBlendSeconds + blurInSeconds : 1f);
 
         // Bring the new photo in on the sphere, then hand over to the sharper layer
         if (blurTransition)
@@ -917,6 +1559,23 @@ public class VR180Viewer : MonoBehaviour
 
         if (useLayer) ShowLayer();
         busy = false;
+        // The picker's thumbnail, if it hasn't one yet: almost free from the copy just made
+        VR180Thumbnails.FromViewed(path, current, currentInfo.coverage, currentInfo.sideBySide, PhotoTilt);
+    }
+
+    void ShowTiltHint(float seconds)
+    {
+        if (tiltHint == null || tiltHintDegrees <= 0f || head == null || PhotoTilt == Quaternion.identity) return;
+        Vector4 c = currentInfo.coverage;
+        float lon = (c.x + c.y) * 0.5f, lat = (c.z + c.w) * 0.5f;
+        Vector3 centre = Display * new Vector3(Mathf.Sin(lon) * Mathf.Cos(lat), Mathf.Sin(lat), Mathf.Cos(lon) * Mathf.Cos(lat));
+        float centreEl = Mathf.Asin(Mathf.Clamp(centre.y, -1f, 1f)) * Mathf.Rad2Deg;
+        float gazeEl = Mathf.Asin(Mathf.Clamp(head.forward.y, -1f, 1f)) * Mathf.Rad2Deg;
+        float delta = centreEl - gazeEl;
+        if (Mathf.Abs(centreEl) < tiltHintDegrees || Mathf.Abs(delta) < tiltHintDegrees) return;
+        tiltHint.Show(delta > 0f, seconds);
+        Debug.Log($"VR180Viewer: the photo's centre is {Mathf.Abs(centreEl):F0} deg {(centreEl > 0f ? "up" : "down")} " +
+                  $"({Mathf.Abs(delta):F0} deg from your gaze), so a brief arrow points {(delta > 0f ? "up" : "down")}");
     }
 
     // Copies the decoded photo into a texture with a complete mip chain, generated on the GPU,
@@ -939,7 +1598,7 @@ public class VR180Viewer : MonoBehaviour
         return temp;
     }
 
-    static RenderTexture MakeMipmapped(Texture src, int halvings, bool fisheye = false, VR180Fisheye.Raw raw = default)
+    internal static RenderTexture MakeMipmapped(Texture src, int halvings, bool fisheye = false, VR180Fisheye.Raw raw = default)
     {
         RenderTexture temp = HalveTemp(src, halvings);
         Texture from = temp != null ? temp : src;
@@ -954,12 +1613,50 @@ public class VR180Viewer : MonoBehaviour
             anisoLevel = 8
         };
         rt.Create();
-        Material convert = fisheye ? VR180Fisheye.ConversionMaterial(raw, from.width) : null;
+        Material convert = fisheye ? VR180Fisheye.ConversionMaterial(raw, from.width, from.height) : null;
         if (convert != null) Graphics.Blit(from, rt, convert);   // halved fisheye -> equirect at this size
         else Graphics.Blit(from, rt);
         rt.GenerateMips();
         if (temp != null) RenderTexture.ReleaseTemporary(temp);
         return rt;
+    }
+
+    // Makes the soft fill's pole-free copies of the current photo (one per eye; see
+    // Hidden/VR180/FillBake), from the sphere's mipmapped copy. A few milliseconds on the GPU.
+    void BakeFillMaps()
+    {
+        if (current == null) return;
+        if (fillBakeMaterial == null)
+        {
+            var shader = Resources.Load<Shader>("VR180FillBake");
+            if (shader == null) { Debug.LogWarning("VR180Viewer: Resources/VR180FillBake.shader is missing; the fill uses the photo's own mips"); return; }
+            fillBakeMaterial = new Material(shader);
+        }
+        fillBakeMaterial.SetVector(CoverageId, currentInfo.coverage);
+        fillBakeMaterial.SetFloat(StereoId, currentInfo.sideBySide ? 1f : 0f);
+        fillBakeMaterial.SetFloat(FillMirrorId, viewerMaterial.GetFloat(FillMirrorId));
+        fillBakeMaterial.SetFloat("_MapSize", FillMapSize);
+        for (int eye = 0; eye < 2; eye++)
+        {
+            if (fillMaps[eye] == null)
+            {
+                fillMaps[eye] = new RenderTexture(FillMapSize, FillMapSize, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB)
+                {
+                    name = eye == 0 ? "VR180 fill (left)" : "VR180 fill (right)",
+                    useMipMap = true,
+                    autoGenerateMips = false,
+                    filterMode = FilterMode.Trilinear,
+                    wrapMode = TextureWrapMode.Clamp
+                };
+                fillMaps[eye].Create();
+            }
+            fillBakeMaterial.SetFloat(EyeId, eye);
+            Graphics.Blit(current, fillMaps[eye], fillBakeMaterial);
+            fillMaps[eye].GenerateMips();
+        }
+        viewerMaterial.SetTexture(FillMap0Id, fillMaps[0]);
+        viewerMaterial.SetTexture(FillMap1Id, fillMaps[1]);
+        viewerMaterial.SetFloat(FillMapSizeId, FillMapSize);
     }
 
     // ------------------------------------------------------------------ compositor layer
@@ -985,11 +1682,15 @@ public class VR180Viewer : MonoBehaviour
         extractMaterial.SetVector(CoverageId, currentInfo.coverage);
         extractMaterial.SetFloat(StereoId, currentInfo.sideBySide ? 1f : 0f);
         extractMaterial.SetFloat(FisheyeId, currentInfo.fisheye ? 1f : 0f);
-        if (currentInfo.fisheye) VR180Fisheye.SetParams(extractMaterial, currentInfo.raw, src.width);
+        if (currentInfo.fisheye) VR180Fisheye.SetParams(extractMaterial, currentInfo.raw, src.width, src.height);
         extractMaterial.SetFloat(EdgeFeatherId, viewerMaterial.GetFloat(EdgeFeatherId));
         extractMaterial.SetFloat(FlipYId, flipLayerVertically ? 1f : 0f);
         extractMaterial.SetFloat(ForceOpaqueId, forceOpaqueLayer ? 1f : 0f);
         ApplyAdjust(extractMaterial, adjust);   // the layer image carries the photo's adjustments
+        // A telephoto zoom is baked into the image (the layer's angles stay unzoomed)
+        layerBakeZoom = Telephoto && StereoLayers ? zoom : 1f;
+        layerBakeCentre = zoomCentre;
+        extractMaterial.SetVector(TeleZoomId, new Vector4(layerBakeZoom, zoomCentre.x, zoomCentre.y, 0f));
 
         // Reuse the existing eye textures if they're the right size, otherwise replace them
         bool reuse = !layerUsesTexture2D &&
@@ -1048,7 +1749,7 @@ public class VR180Viewer : MonoBehaviour
             return;
         }
         Vector4 c = currentInfo.coverage;
-        data.Radius = layerRadius;
+        data.Radius = EffectiveLayerRadius;
         data.CentralHorizontalAngle = c.y - c.x;
         data.UpperVerticalAngle = c.w;
 
@@ -1227,23 +1928,48 @@ public class VR180Viewer : MonoBehaviour
         if (photoLayer == null || head == null) return;
         // Turn the layer so its centre matches the centre of the photo's coverage
         float centreLon = (currentInfo.coverage.x + currentInfo.coverage.y) * 0.5f * Mathf.Rad2Deg;
-        Quaternion rot = imageToWorld * Quaternion.Euler(0f, centreLon, 0f);
+        // Zoom (our handler only, i.e. on the Quest): a cropped part of the image over scaled angles,
+        // unless a telephoto zoom is baked into the image itself
+        bool zoomed = zoom != 1f && VR180StereoEquirectHandler.Active && layerBakeZoom == 1f;
+        Rect crop = default;
+        float central = 0f, upper = 0f, lower = 0f;
+        if (zoomed) ZoomedLayerView(out crop, out central, out upper, out lower, out centreLon);
+        VR180StereoEquirectHandler.CropFromBottom = !SystemInfo.graphicsUVStartsAtTop ^ zoomCropFlipY;
+        VR180StereoEquirectHandler.SetZoom(photoLayer, zoomed, crop, central, upper, lower);
+        VR180StereoEquirectHandler.SetZoom(photoLayerRight, zoomed, crop, central, upper, lower);
+        bool filter = layerFilterOn && (layerFilterFromZoom <= 0f || zoom > layerFilterFromZoom + 1e-4f);
+        VR180StereoEquirectHandler.SettingsFlags = filter ? LayerFilterFlags(layerFilter) : 0;
+        Quaternion rot = Display * Quaternion.Euler(0f, centreLon, 0f);
         // Convergence: turn the left eye's image right and the right eye's left by half each
         // (positive = crossed = nearer), matching the sphere shader. Only with one layer per eye.
-        float half = StereoLayers ? adjust.convergence * 0.5f : 0f;
+        // Zoom magnifies it too, as the shader applies it within the photo.
+        float half = StereoLayers ? adjust.convergence * 0.5f * (zoomed || layerBakeZoom != 1f ? zoom : 1f) : 0f;
+        // Head-turn parallax: each eye's layer centred where that eye would be had the head not
+        // turned (with one layer for both eyes, the head's); otherwise centred on the head
+        float radius = EffectiveLayerRadius;
+        SetLayerRadius(photoLayer, radius);
+        SetLayerRadius(photoLayerRight, radius);
+        Vector3 posL = head.position, posR = head.position;
+        if (parallaxDistance > 0f)
+        {
+            if (StereoLayers) EyePositions(out posL, out posR);
+            posL -= parallaxOffset;
+            posR -= parallaxOffset;
+        }
         // Roll compensation turns both about the line of sight (identity when it's off)
-        photoLayer.transform.SetPositionAndRotation(head.position, viewRoll * Quaternion.Euler(0f, half, 0f) * rot);
-        if (photoLayerRight != null) photoLayerRight.transform.SetPositionAndRotation(head.position, viewRoll * Quaternion.Euler(0f, -half, 0f) * rot);
+        // (Convergence turns about the photo's own vertical, which is the world's unless a raw photo is levelled by the sphere.)
+        photoLayer.transform.SetPositionAndRotation(posL, viewRoll * rot * Quaternion.Euler(0f, half, 0f));
+        if (photoLayerRight != null) photoLayerRight.transform.SetPositionAndRotation(posR, viewRoll * rot * Quaternion.Euler(0f, -half, 0f));
     }
 
     // ------------------------------------------------------------------ metadata
 
     // Reads the Google VR180 / GPano XMP fields near the start of the file.
     // Falls back to 180 x 180 degrees, side-by-side, if they're missing.
-    static PhotoInfo ReadMetadata(string path)
+    internal static PhotoInfo ReadMetadata(string path)
     {
         const float H = Mathf.PI / 2f;
-        var info = new PhotoInfo { coverage = new Vector4(-H, H, -H, H), sideBySide = true };
+        var info = new PhotoInfo { coverage = new Vector4(-H, H, -H, H), sideBySide = true, baseline = Vector3.right, tilt = Quaternion.identity };
 
         string text;
         try
@@ -1290,7 +2016,13 @@ public class VR180Viewer : MonoBehaviour
             info.fisheye = true;
             info.sideBySide = true;
             info.coverage = new Vector4(-H, H, -H, H);
+            info.baseline = VR180Fisheye.Baseline(info.raw);
+            info.tilt = VR180Fisheye.DisplayTilt(info.raw);
         }
+        // A QooCam Studio photo with the camera's gravity reading copied back in (qoocam_tag_studio.py):
+        // already stitched, in the camera's own frame, so it only needs the levelling turn
+        else if (VR180Fisheye.TryGetStitchedTilt(path, out info.raw))
+            info.tilt = VR180Fisheye.StitchedTilt(info.raw);
         return info;
     }
 
@@ -1330,8 +2062,33 @@ public class VR180Viewer : MonoBehaviour
         f.y = 0f;
         if (f.sqrMagnitude < 1e-4f) f = Vector3.forward;
         imageToWorld = Quaternion.LookRotation(f.normalized, Vector3.up);
-        viewerMaterial.SetMatrix(WorldToImageId, Matrix4x4.Rotate(Quaternion.Inverse(viewRoll * imageToWorld)));
+        viewerMaterial.SetMatrix(WorldToImageId, Matrix4x4.Rotate(Quaternion.Inverse(viewRoll * Display)));
         if (photoLayer != null && photoLayer.gameObject.activeSelf) UpdateLayerPose();
+    }
+
+    // The headset's own recentre (holding the Quest button) resets its "local" tracking space to
+    // where you're facing. Ask for that space (Device), rather than one fixed to the room, so it
+    // happens; and when it does, recentre the photo too, which also clears any recentre made with
+    // the thumbstick. (The new head pose arrives a frame or two after the event, hence the delay.)
+    void WatchHeadsetRecentre()
+    {
+        SubsystemManager.GetSubsystems(inputSubsystems);
+        foreach (var sub in inputSubsystems)
+        {
+            var mode = sub.GetTrackingOriginMode();
+            if (mode != UnityEngine.XR.TrackingOriginModeFlags.Device &&
+                (sub.GetSupportedTrackingOriginModes() & UnityEngine.XR.TrackingOriginModeFlags.Device) != 0)
+            {
+                bool ok = sub.TrySetTrackingOriginMode(UnityEngine.XR.TrackingOriginModeFlags.Device);
+                Debug.Log($"VR180Viewer: tracking origin {mode} -> Device {(ok ? "done" : "refused")}");
+            }
+            sub.trackingOriginUpdated += OnTrackingOriginUpdated;
+        }
+    }
+
+    void OnTrackingOriginUpdated(UnityEngine.XR.XRInputSubsystem sub)
+    {
+        if (centredOnce) recentreAt = Time.unscaledTime + 0.15f;
     }
 
     // Eases a material float to a target value

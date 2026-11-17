@@ -1,4 +1,4 @@
-// VR180AdjustPanel: the in-headset picture adjustments panel (A button), built in code at
+// VR180AdjustPanel: the in-headset picture adjustments panel (B button), built in code at
 // runtime by VR180Viewer, in the same style as the folder picker.
 //
 // Sliders for brightness (exposure, in stops), contrast, saturation and convergence (the two
@@ -6,6 +6,16 @@
 // photo, and sharpness (mip bias), which applies to all photos. Drag a slider with the
 // controller ray and trigger. Changes show live on the photo behind the panel; on the Quest
 // the sharp compositor layer is rebuilt with them when the panel closes.
+//
+// Head-turn parallax (experimental, all photos): the distance at which things stay put as the head
+// turns, or off. The slider is logarithmic, 0.7 m to 50 m, with "off" at its left end.
+//
+// For raw QooCam photos with a gravity reading there is also "Level the horizon" (saved per photo);
+// changing it reloads the photo when the panel closes, since levelling is part of the conversion.
+//
+// Layout (15 November 2026): twice the old width, in two columns: this photo's settings on the
+// left (favourite, brightness, contrast, saturation, convergence, levelling), the settings for all
+// photos on the right (sharpness, roll compensation, head-turn parallax). Labels shrink to fit.
 
 using System;
 using TMPro;
@@ -15,7 +25,9 @@ using UnityEngine.XR.Interaction.Toolkit.UI;
 
 public class VR180AdjustPanel : MonoBehaviour
 {
-    const float PanelWidth = 820f, PanelHeight = 1250f;   // canvas units (1 unit = 1 mm)
+    const float PanelWidth = 1640f, PanelHeight = 1180f;  // canvas units (1 unit = 1 mm)
+    const float ColumnGap = 60f;
+    const float ParallaxMin = 0.7f, ParallaxMax = 50f, ParallaxOff = 0.03f;   // metres; slider values below ParallaxOff = off
 
     VR180Viewer viewer;
     Canvas canvas;
@@ -24,8 +36,13 @@ public class VR180AdjustPanel : MonoBehaviour
     TextMeshProUGUI exposureText, contrastText, saturationText, convergenceText, mipBiasText;
     Toggle convergenceForAll;   // ticked: this photo follows (and sets) the default convergence
     Toggle favourite;
+    Toggle level;               // raw photos only: level the horizon from the camera's gravity reading
+    TextMeshProUGUI levelText;
+    bool levelShown, keepTiltIn;
     Slider roll;
     TextMeshProUGUI rollText;
+    Slider parallax;
+    TextMeshProUGUI parallaxText;
     bool updating;   // true while the sliders are being set from code
 
     public bool IsOpen => canvas != null && canvas.gameObject.activeSelf;
@@ -37,10 +54,17 @@ public class VR180AdjustPanel : MonoBehaviour
         canvas.gameObject.SetActive(false);
     }
 
-    public void Open(Transform head, string photoName, VR180Adjustments.Values v, float bias, bool isFavourite, float rollStrength)
+    /// tilt: a description of the camera's tilt for a raw photo whose levelling can be switched off, else null
+    public void Open(Transform head, string photoName, VR180Adjustments.Values v, float bias, bool isFavourite, float rollStrength,
+                     float parallaxMetres, string tilt = null)
     {
         titleText.text = photoName;
+        levelShown = tilt != null;
+        keepTiltIn = v.keepTilt;
+        level.gameObject.SetActive(levelShown);
+        if (levelShown) levelText.text = $"Level the horizon  ({tilt})";
         roll.SetValueWithoutNotify(rollStrength);
+        parallax.SetValueWithoutNotify(ParallaxToSlider(parallaxMetres));
         SetSliders(v, bias);
         favourite.SetIsOnWithoutNotify(isFavourite);
         PlaceInFrontOf(head);
@@ -64,7 +88,9 @@ public class VR180AdjustPanel : MonoBehaviour
         f.y = 0f;
         if (f.sqrMagnitude < 1e-4f) f = Vector3.forward;
         f.Normalize();
-        Vector3 pos = head.position + f * 1.1f + Vector3.down * 0.42f;
+        float k = VR180Viewer.UIScale;
+        canvas.transform.localScale = Vector3.one * 0.001f * k;
+        Vector3 pos = head.position + f * 1.1f + Vector3.down * (0.42f * k);
         canvas.transform.SetPositionAndRotation(pos, Quaternion.LookRotation(pos - head.position, Vector3.up));
     }
 
@@ -76,6 +102,7 @@ public class VR180AdjustPanel : MonoBehaviour
         saturation.value = v.saturation;
         convergence.value = v.convergence;
         convergenceForAll.isOn = !v.ownConvergence;
+        level.isOn = !v.keepTilt;
         mipBias.value = bias;
         updating = false;
         UpdateLabels();
@@ -87,7 +114,8 @@ public class VR180AdjustPanel : MonoBehaviour
         contrast = contrast.value,
         saturation = saturation.value,
         convergence = convergence.value,
-        ownConvergence = !convergenceForAll.isOn
+        ownConvergence = !convergenceForAll.isOn,
+        keepTilt = levelShown ? !level.isOn : keepTiltIn
     };
 
     void Changed()
@@ -105,9 +133,19 @@ public class VR180AdjustPanel : MonoBehaviour
                                $"{(convergenceForAll.isOn ? "all photos" : "this photo only")})";
         mipBiasText.text = $"Sharpness (mip bias)   {mipBias.value:+0.00;-0.00;0.00}";
         rollText.text = roll.value > 0.004f
-            ? $"Roll compensation   {roll.value * 100f:0}%   (experimental)"
-            : "Roll compensation   off   (experimental)";
+            ? $"Roll compensation   {roll.value * 100f:0}%"
+            : "Roll compensation   off";
+        float m = SliderToParallax(parallax.value);
+        parallaxText.text = m > 0f
+            ? $"Head-turn parallax   {m:0.0} m"
+            : "Head-turn parallax   off";
     }
+
+    static float SliderToParallax(float s) =>
+        s < ParallaxOff ? 0f : ParallaxMin * Mathf.Pow(ParallaxMax / ParallaxMin, Mathf.InverseLerp(ParallaxOff, 1f, s));
+
+    static float ParallaxToSlider(float metres) =>
+        metres <= 0f ? 0f : Mathf.Lerp(ParallaxOff, 1f, Mathf.Log(Mathf.Clamp(metres, ParallaxMin, ParallaxMax) / ParallaxMin) / Mathf.Log(ParallaxMax / ParallaxMin));
 
     void ResetPhoto()
     {
@@ -144,26 +182,47 @@ public class VR180AdjustPanel : MonoBehaviour
         titleText.overflowMode = TextOverflowModes.Ellipsis;
         titleText.gameObject.AddComponent<LayoutElement>().preferredHeight = 60;
 
-        favourite = AddToggle(bg, "Favourite", on => viewer.SetFavourite(on));
-        Spacer(bg, 6);
+        // Two columns side by side, with a thin bar between them
+        var columns = NewUI("Columns", bg);
+        columns.gameObject.AddComponent<LayoutElement>().flexibleHeight = 1;
+        var h2 = columns.gameObject.AddComponent<HorizontalLayoutGroup>();
+        h2.spacing = ColumnGap;
+        h2.childControlWidth = h2.childControlHeight = true;
+        h2.childForceExpandWidth = true;
+        h2.childForceExpandHeight = true;
+        var left = AddColumn(columns, "This photo");
+        var right = AddColumn(columns, "All photos");
+        var divider = NewUI("Divider", columns);
+        divider.gameObject.AddComponent<LayoutElement>().ignoreLayout = true;
+        divider.anchorMin = new Vector2(0.5f, 0.03f);
+        divider.anchorMax = new Vector2(0.5f, 0.97f);
+        divider.sizeDelta = new Vector2(3f, 0f);
+        divider.anchoredPosition = Vector2.zero;
+        var dividerImage = divider.gameObject.AddComponent<Image>();
+        dividerImage.color = new Color(1f, 1f, 1f, 0.12f);
+        dividerImage.raycastTarget = false;
 
-        exposure   = AddSetting(bg, -2f, 2f, out exposureText);
-        contrast   = AddSetting(bg, 0.5f, 1.5f, out contrastText);
-        saturation = AddSetting(bg, 0f, 2f, out saturationText);
-        convergence = AddSetting(bg, -2f, 2f, out convergenceText);
-        convergenceForAll = AddToggle(bg, "Use this convergence for all photos (the default)", _ => Changed());
-        Spacer(bg, 10);
-        mipBias    = AddSetting(bg, -2f, 1f, out mipBiasText);
-        roll       = AddSetting(bg, 0f, 1f, out rollText);
+        // Left: this photo
+        favourite = AddToggle(left, "Favourite", on => viewer.SetFavourite(on));
+        exposure   = AddSetting(left, -2f, 4f, out exposureText);
+        contrast   = AddSetting(left, 0.5f, 1.5f, out contrastText);
+        saturation = AddSetting(left, 0f, 2f, out saturationText);
+        convergence = AddSetting(left, -2f, 2f, out convergenceText);
+        convergenceForAll = AddToggle(left, "Use this convergence for all photos (the default)", _ => Changed());
+        level = AddToggle(left, "Level the horizon", _ => Changed());
+        levelText = level.GetComponentInChildren<TextMeshProUGUI>();
+        AddNote(left, "Saved for this photo; convergence too, unless it's for all photos.");
+
+        // Right: all photos
+        mipBias    = AddSetting(right, -2f, 1f, out mipBiasText);
+        roll       = AddSetting(right, 0f, 1f, out rollText);
         roll.onValueChanged.AddListener(v => { if (!updating) viewer.SetRollCompensation(v); });
+        parallax   = AddSetting(right, 0f, 1f, out parallaxText);
+        parallax.onValueChanged.AddListener(v => { if (!updating) viewer.SetParallaxDistance(SliderToParallax(v)); });
+        AddNote(right, "Sharpness affects the PC view and this preview only. Roll compensation acts only when looking " +
+                       "down and to the side. Head-turn parallax: things at this distance stay put as you turn your head.");
 
-        var note = NewText("Note", bg, 26, FontStyles.Italic, new Color(0.65f, 0.67f, 0.72f));
-        note.textWrappingMode = TextWrappingModes.Normal;
-        note.text = "Brightness, contrast and saturation are saved for this photo; convergence too, unless it's for all photos. " +
-                    "Sharpness (PC view and this preview only) and roll compensation apply to all photos.";
-        note.gameObject.AddComponent<LayoutElement>().preferredHeight = 80;
-
-        Spacer(bg, 6);
+        Spacer(bg, 10);
         var buttons = NewUI("Buttons", bg);
         var h = buttons.gameObject.AddComponent<HorizontalLayoutGroup>();
         h.spacing = 20;
@@ -172,12 +231,45 @@ public class VR180AdjustPanel : MonoBehaviour
         h.childForceExpandHeight = true;
         buttons.gameObject.AddComponent<LayoutElement>().preferredHeight = 84;
         AddButton(buttons, "Reset photo", ResetPhoto, false);
-        AddButton(buttons, "Done  (A)", () => viewer.CloseAdjustments(), true);
+        AddButton(buttons, "Done  (B)", () => viewer.CloseAdjustments(), true);
+    }
+
+    // A column: a small heading, then its settings stacked from the top
+    RectTransform AddColumn(RectTransform parent, string heading)
+    {
+        var col = NewUI(heading, parent);
+        // Equal halves whatever the text inside (otherwise each column is sized by its longest label)
+        var share = col.gameObject.AddComponent<LayoutElement>();
+        share.minWidth = 0f;
+        share.preferredWidth = 0f;
+        share.flexibleWidth = 1f;
+        var v = col.gameObject.AddComponent<VerticalLayoutGroup>();
+        v.spacing = 8;
+        v.childControlWidth = v.childControlHeight = true;
+        v.childForceExpandWidth = true;
+        v.childForceExpandHeight = false;
+        var title = NewText("Heading", col, 28, FontStyles.Bold, new Color(0.55f, 0.72f, 0.95f));
+        title.text = heading.ToUpperInvariant();
+        title.characterSpacing = 6;
+        title.gameObject.AddComponent<LayoutElement>().preferredHeight = 44;
+        return col;
+    }
+
+    static void AddNote(RectTransform parent, string text)
+    {
+        var note = NewText("Note", parent, 26, FontStyles.Italic, new Color(0.65f, 0.67f, 0.72f));
+        note.textWrappingMode = TextWrappingModes.Normal;
+        note.text = text;
+        note.gameObject.AddComponent<LayoutElement>().minHeight = 40;
     }
 
     Slider AddSetting(RectTransform parent, float min, float max, out TextMeshProUGUI label)
     {
         label = NewText("Label", parent, 34, FontStyles.Normal, Color.white);
+        label.textWrappingMode = TextWrappingModes.NoWrap;
+        label.enableAutoSizing = true;   // long values shrink to fit the column rather than overflow
+        label.fontSizeMin = 22;
+        label.fontSizeMax = 34;
         label.gameObject.AddComponent<LayoutElement>().preferredHeight = 48;
 
         var holder = NewUI("Slider", parent);
@@ -256,7 +348,10 @@ public class VR180AdjustPanel : MonoBehaviour
         Stretch(text.rectTransform);
         text.rectTransform.offsetMin = new Vector2(70f, 0f);
         text.alignment = TextAlignmentOptions.MidlineLeft;
-        text.textWrappingMode = TextWrappingModes.NoWrap;
+        text.textWrappingMode = TextWrappingModes.Normal;   // up to two lines, shrinking if need be
+        text.enableAutoSizing = true;
+        text.fontSizeMin = 20;
+        text.fontSizeMax = 30;
         text.overflowMode = TextOverflowModes.Ellipsis;
         text.text = label;
 

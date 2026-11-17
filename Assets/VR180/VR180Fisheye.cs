@@ -17,7 +17,26 @@
 // Without a file, the built-in calibration (Graham's camera, QU9302327745) is used, with a warning.
 //
 // Levelling: the minimal rotation that makes the camera's gravity reading (IMUHEX in the EXIF
-// comment, accelerometer at 2048 per g) point straight down. Can be switched off.
+// comment, accelerometer at 2048 per g) point straight down. Can be switched off for all photos
+// (Levelling) or for one photo (its "Level the horizon" box in the adjustments panel: keepTilt).
+// Since 12 November it's done by turning the viewer's sphere and layers (DisplayTilt): the picture
+// is converted in the camera's own frame, so nothing the lenses saw is lost, and a shot taken
+// pointing well down (or up) can be looked at all the way to where the camera pointed, with a
+// level horizon. LevelBySphere = false puts back the old way (levelling inside the conversion,
+// which cuts off whatever was beyond 90 degrees above or below the horizon).
+//
+// Lens patch: each lens sees part of the other lens at the edge of its view (on Graham's camera the
+// left lens sees the right lens's barrel from about 83 degrees off its axis, so it shows inside the
+// 180-degree picture; the right lens only sees the left one from about 94 degrees, just outside it).
+// Where a lens is obstructed, the shader takes that direction from the other lens instead. The
+// obstruction is measured from Graham's camera (10 November 2026), in each lens's own frame.
+//
+// Photos already stitched by QooCam Studio (14 November): Studio drops the gravity reading from its
+// output, so qoocam_tag_studio.py (run on the PC) copies IMUHEX back in as a JPEG comment. A stitched
+// photo that has one (TryGetStitchedTilt) is levelled by turning the sphere, exactly like a raw photo:
+// with Studio's Horizon Correction off, its picture is in the same camera frame as our own conversion
+// (measured: within 0.02 degrees). A photo Studio levelled itself must not be tagged (or untick its
+// "Level the horizon" box), or it is turned twice.
 //
 // Not done (yet): lens shading (GAINMAP0/1 in the EXIF comment), Studio's colour processing.
 
@@ -34,6 +53,21 @@ public static class VR180Fisheye
 {
     /// Level the horizon from the camera's gravity reading, as QooCam Studio does
     public static bool Levelling = true;
+
+    /// Level by turning the sphere and layers (true), or inside the conversion as before (false)
+    public static bool LevelBySphere = true;
+
+    /// Fill in where each lens sees the other one, from the other lens (see the notes at the top)
+    public static bool LensPatch = true;
+
+    // Where each lens sees the other one, in degrees in its own frame (x right, y up, z ahead):
+    // (inner edge, measured from the lens's axis towards the other lens; centre latitude; half
+    // height; corner radius). A is the other lens's barrel, B the housing round it, which starts
+    // further out and is taller. Measured on Graham's camera; the patch extends OccMargin beyond
+    // these, then fades out over OccFeather, so other cameras built the same way should be covered.
+    static readonly Vector4[] OccA = { new Vector4(83.1f, 1.6f, 15.3f, 4f), new Vector4(93.75f, 0.3f, 14.7f, 4f) };
+    static readonly Vector4[] OccB = { new Vector4(89.6f, 0f, 35f, 10f),    new Vector4(100.3f, 0f, 35f, 10f) };
+    const float OccMargin = 2f, OccFeather = 3f;
 
     /// Name of the folder (under the photo root) where calibration files go
     public const string CalibrationFolderName = "QooCam Calibration";
@@ -102,6 +136,8 @@ public static class VR180Fisheye
         public Vector3 up;
         public bool hasGravity;
         public string serial;
+        /// This photo is to be shown as the camera was held (its "Level the horizon" box unticked)
+        public bool keepTilt;
         /// Why the camera's own calibration isn't being used (no file, or an unreadable one); null if all's well
         public string calibrationProblem;
         internal Calibration calibration;
@@ -113,32 +149,116 @@ public static class VR180Fisheye
         raw = default;
         if (!IsRaw(path, out raw.up, out raw.hasGravity, out raw.serial)) return false;
         raw.calibration = CalibrationFor(raw.serial, Path.GetDirectoryName(path), out raw.calibrationProblem);
+        raw.keepTilt = VR180Adjustments.Get(path).keepTilt;   // per photo, from the adjustments panel
 
-        float pitch = Mathf.Atan2(raw.up.z, raw.up.y) * Mathf.Rad2Deg, roll = Mathf.Atan2(-raw.up.x, raw.up.y) * Mathf.Rad2Deg;
+        Tilt(raw, out float pitch, out float roll);
         Debug.Log($"VR180Fisheye: {Path.GetFileName(path)} is an unprocessed dual-fisheye photo from camera {raw.serial ?? "(no serial)"}; " +
                   $"calibration {raw.calibration.source}; " +
-                  (raw.hasGravity ? $"camera tilt {pitch:F1} deg pitch, {roll:F1} deg roll, {(Levelling ? "levelled" : "not levelled")}" : "no gravity reading"));
+                  (raw.hasGravity ? $"camera tilt {pitch:F1} deg pitch, {roll:F1} deg roll, " +
+                                    $"{(IsLevelled(raw) ? (LevelBySphere ? "levelled by turning the sphere" : "levelled in the conversion") : raw.keepTilt && Levelling ? "not levelled (this photo's choice)" : "not levelled")}"
+                                  : "no gravity reading"));
         return true;
     }
 
-    /// Sets a material's lens parameters (VR180Fisheye.hlsl) for a source texture of this width
-    public static void SetParams(Material m, Raw raw, int sourceWidth)
+    /// The camera's tilt from its gravity reading, in degrees (pitch + = nose up, roll + = turned clockwise)
+    public static void Tilt(Raw raw, out float pitch, out float roll)
+    {
+        pitch = Mathf.Atan2(raw.up.z, raw.up.y) * Mathf.Rad2Deg;
+        roll = Mathf.Atan2(-raw.up.x, raw.up.y) * Mathf.Rad2Deg;
+    }
+
+    /// Whether this photo's horizon is levelled when converted
+    public static bool IsLevelled(Raw raw) => Levelling && raw.hasGravity && !raw.keepTilt;
+
+    /// The rotation that levels the photo: view direction (level) -> camera body direction
+    static Quaternion LevelRotation(Raw raw) => IsLevelled(raw) ? Quaternion.FromToRotation(Vector3.up, raw.up) : Quaternion.identity;
+
+    /// The rotation applied inside the conversion (only with LevelBySphere off): converted picture -> camera body
+    static Quaternion ConversionRotation(Raw raw) => LevelBySphere ? Quaternion.identity : LevelRotation(raw);
+
+    /// The rotation the viewer applies to the converted picture to level it (only with LevelBySphere on):
+    /// converted picture's frame -> level frame. Identity if the photo isn't levelled.
+    public static Quaternion DisplayTilt(Raw raw) => LevelBySphere ? Quaternion.Inverse(LevelRotation(raw)) : Quaternion.identity;
+
+    /// True for a photo stitched by QooCam Studio that has had the camera's gravity reading copied back
+    /// into it (qoocam_tag_studio.py). Only up, hasGravity, serial and keepTilt are filled in: the photo
+    /// needs no conversion, just the levelling turn (StitchedTilt).
+    public static bool TryGetStitchedTilt(string path, out Raw raw)
+    {
+        raw = default;
+        raw.up = Vector3.up;
+        string text = ReadHead(path);
+        if (text == null || !text.Contains("PRODUCT=QooCam") || !text.Contains("STITCHED=1") || !text.Contains("IMUHEX=")) return false;
+        if (!TryGravity(text, path, out raw.up)) return false;
+        raw.hasGravity = true;
+        var sn = Regex.Match(text, @"\bSN=([A-Za-z0-9]+)");
+        if (sn.Success) raw.serial = sn.Groups[1].Value;
+        raw.keepTilt = VR180Adjustments.Get(path).keepTilt;   // per photo, from the adjustments panel
+
+        Tilt(raw, out float pitch, out float roll);
+        Debug.Log($"VR180Fisheye: {Path.GetFileName(path)} is a QooCam Studio photo carrying the camera's tilt " +
+                  $"({pitch:F1} deg pitch, {roll:F1} deg roll); " +
+                  (IsLevelled(raw) ? "levelled by turning the sphere" : raw.keepTilt && Levelling ? "not levelled (this photo's choice)" : "not levelled"));
+        return true;
+    }
+
+    /// The rotation the viewer applies to such a photo to level it: photo's frame -> level frame.
+    /// Identity if the photo isn't levelled. (Always by turning the sphere, whatever LevelBySphere says.)
+    public static Quaternion StitchedTilt(Raw raw) => Quaternion.Inverse(LevelRotation(raw));
+
+    /// The camera's stereo baseline (its left-to-right axis) in the converted picture's frame
+    /// (x right, y up, z ahead). Just x unless levelling turned the picture inside the conversion;
+    /// then it's tilted by the camera's roll. (Levelled by the sphere, the picture is the camera's own frame.)
+    public static Vector3 Baseline(Raw raw) => Quaternion.Inverse(ConversionRotation(raw)) * Vector3.right;
+
+    // The camera's own image size (the camera JPEG and the DNG are both this)
+    const float CameraWidth = 13888f, CameraHeight = 6944f;
+
+    /// True if an image of this size can be a raw photo: 2:1, allowing for a few pixels trimmed from each edge
+    public static bool PlausibleSize(int width, int height) => height > 0 && Mathf.Abs(width - 2f * height) <= 0.01f * width;
+
+    /// Where the camera's full frame sits in a source image of this size: its scale (1 = full size, 0.5 = halved)
+    /// and the border trimmed from each side, in source pixels. A raw developer may drop a few pixels from every
+    /// edge (RawTherapee drops 4 unless its demosaicing Border is 0); that's a trim, not a smaller picture.
+    static void SourceFraming(int sourceWidth, int sourceHeight, out float scale, out float trimX, out float trimY)
+    {
+        scale = sourceWidth / CameraWidth;
+        trimX = trimY = 0f;
+        if (sourceHeight <= 0) return;
+        float p = Mathf.Pow(2f, Mathf.Round(Mathf.Log(scale, 2f)));   // the nearest of 1, 1/2, 1/4...
+        float tx = (CameraWidth * p - sourceWidth) * 0.5f, ty = (CameraHeight * p - sourceHeight) * 0.5f;
+        if (tx >= 0f && ty >= 0f && tx <= 32f * p && ty <= 32f * p)
+        {
+            scale = p;
+            trimX = tx;
+            trimY = ty;
+        }
+    }
+
+    /// Sets a material's lens parameters (VR180Fisheye.hlsl) for a source texture of this size
+    /// (height 0 = unknown: then the image is assumed to be the whole frame, scaled)
+    public static void SetParams(Material m, Raw raw, int sourceWidth, int sourceHeight = 0)
     {
         Calibration cal = raw.calibration ?? BuiltIn;
-        float s = sourceWidth / cal.width;
-        bool level = Levelling && raw.hasGravity;
-        Matrix4x4 levelling = level ? Matrix4x4.Rotate(Quaternion.FromToRotation(Vector3.up, raw.up)) : Matrix4x4.identity;
+        SourceFraming(sourceWidth, sourceHeight, out float scale, out float trimX, out float trimY);
+        float s = scale * CameraWidth / cal.width;   // calibration pixels -> source pixels
+        Matrix4x4 levelling = Matrix4x4.Rotate(ConversionRotation(raw));
         for (int eye = 0; eye < 2; eye++)
         {
             Lens lens = cal.lenses[eye];
             m.SetMatrix(eye == 0 ? "_M0" : "_M1", lens.bodyToLens * levelling);
-            m.SetVector(eye == 0 ? "_Lens0" : "_Lens1", new Vector4(lens.f * s, lens.cx * s, lens.cy * s, CircleRadiusFraction * sourceWidth));
+            m.SetVector(eye == 0 ? "_Lens0" : "_Lens1", new Vector4(lens.f * s, lens.cx * s - trimX, lens.cy * s - trimY,
+                                                                    CircleRadiusFraction * CameraWidth * scale));
             m.SetVector(eye == 0 ? "_K0" : "_K1", lens.k);
+            m.SetVector(eye == 0 ? "_OccA0" : "_OccA1", OccA[eye]);
+            m.SetVector(eye == 0 ? "_OccB0" : "_OccB1", OccB[eye]);
         }
+        m.SetFloat("_LensPatch", LensPatch ? 1f : 0f);
+        m.SetVector("_OccFeather", new Vector4(OccMargin, OccFeather, 0f, 0f));
     }
 
-    /// The FisheyeToEquirect material, set up for a source texture of this width (null if the shader is missing)
-    public static Material ConversionMaterial(Raw raw, int sourceWidth)
+    /// The FisheyeToEquirect material, set up for a source texture of this size (null if the shader is missing)
+    public static Material ConversionMaterial(Raw raw, int sourceWidth, int sourceHeight = 0)
     {
         if (material == null)
         {
@@ -150,7 +270,7 @@ public static class VR180Fisheye
             }
             material = new Material(shader);
         }
-        SetParams(material, raw, sourceWidth);
+        SetParams(material, raw, sourceWidth, sourceHeight);
         return material;
     }
 
@@ -159,39 +279,52 @@ public static class VR180Fisheye
         up = Vector3.up;
         hasGravity = false;
         serial = null;
-        string text;
-        try
-        {
-            using var fs = File.OpenRead(path);
-            var buf = new byte[(int)Math.Min(fs.Length, 64 * 1024)];   // the EXIF block is at the start
-            int read = 0, n;
-            while (read < buf.Length && (n = fs.Read(buf, read, buf.Length - read)) > 0) read += n;
-            text = Encoding.ASCII.GetString(buf, 0, read);
-        }
-        catch (Exception) { return false; }
+        string text = ReadHead(path);
+        if (text == null) return false;
 
         if (!text.Contains("PRODUCT=QooCam") || !text.Contains("STITCHED=0") || !text.Contains("LENS=")) return false;
 
         var sn = Regex.Match(text, @"\bSN=([A-Za-z0-9]+)");
         if (sn.Success) serial = sn.Groups[1].Value;
 
+        hasGravity = TryGravity(text, path, out up);
+        return true;
+    }
+
+    /// The first 64 KB of a file as text (the EXIF block is at the start), or null if it can't be read
+    static string ReadHead(string path)
+    {
+        try
+        {
+            using var fs = File.OpenRead(path);
+            var buf = new byte[(int)Math.Min(fs.Length, 64 * 1024)];
+            int read = 0, n;
+            while (read < buf.Length && (n = fs.Read(buf, read, buf.Length - read)) > 0) read += n;
+            return Encoding.ASCII.GetString(buf, 0, read);
+        }
+        catch (Exception) { return null; }
+    }
+
+    /// The camera's gravity reading (IMUHEX) as an "up" direction in the camera's frame; false (and up
+    /// straight up) if there is none or it doesn't look like 1 g
+    static bool TryGravity(string text, string path, out Vector3 up)
+    {
+        up = Vector3.up;
         // Nine little-endian 16-bit values; the accelerometer is the middle three
         var m = Regex.Match(text, "IMUHEX=([0-9A-Fa-f]{36})");
-        if (m.Success)
+        if (!m.Success) return false;
+        string hex = m.Groups[1].Value;
+        short Value(int k) => (short)(int.Parse(hex.Substring(k * 4, 2), NumberStyles.HexNumber) |
+                                      (int.Parse(hex.Substring(k * 4 + 2, 2), NumberStyles.HexNumber) << 8));
+        var a = new Vector3(Value(3), Value(4), Value(5));
+        float g = a.magnitude;
+        if (g > 1500f && g < 2600f)   // about 1 g: the camera was held still
         {
-            string hex = m.Groups[1].Value;
-            short Value(int k) => (short)(int.Parse(hex.Substring(k * 4, 2), NumberStyles.HexNumber) |
-                                          (int.Parse(hex.Substring(k * 4 + 2, 2), NumberStyles.HexNumber) << 8));
-            var a = new Vector3(Value(3), Value(4), Value(5));
-            float g = a.magnitude;
-            if (g > 1500f && g < 2600f)   // about 1 g: the camera was held still
-            {
-                up = -a / g;
-                hasGravity = true;
-            }
-            else Debug.LogWarning($"VR180Fisheye: {Path.GetFileName(path)}: gravity reading {a} looks wrong; not levelling");
+            up = -a / g;
+            return true;
         }
-        return true;
+        Debug.LogWarning($"VR180Fisheye: {Path.GetFileName(path)}: gravity reading {a} looks wrong; not levelling");
+        return false;
     }
 
     // ------------------------------------------------------------------ calibration files
@@ -329,12 +462,12 @@ public static class VR180Fisheye
     public static Texture ConvertIfRaw(Texture2D src, string path)
     {
         if (src == null || !TryGetRaw(path, out Raw raw)) return src;
-        if (src.width != src.height * 2)
+        if (!PlausibleSize(src.width, src.height))
         {
             Debug.LogWarning($"VR180Fisheye: {Path.GetFileName(path)} is {src.width}x{src.height}, not 2:1; left as it is");
             return src;
         }
-        Material mat = ConversionMaterial(raw, src.width);
+        Material mat = ConversionMaterial(raw, src.width, src.height);
         if (mat == null) return src;
 
         var rt = new RenderTexture(src.width, src.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB)
