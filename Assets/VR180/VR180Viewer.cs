@@ -36,6 +36,10 @@
 // when the first one appeared. It doesn't follow your head from photo to photo. The headset's own
 // recentre (hold the Quest button) moves "straight ahead" to where you're facing, and the photo
 // with it; holding the right thumbstick click does the same within the app.
+//
+// Kept photos (19 November 2026): the photo just left is kept, and the next one in the direction
+// you're going is prepared while you look at the current one, so stepping to either is a short
+// crossfade with no decode (see Keep Previous, Preload Next and the kept photos section below).
 
 using System;
 using System.Collections;
@@ -66,6 +70,9 @@ public class VR180Viewer : MonoBehaviour
     [Tooltip("Radius of the viewing sphere in metres. It doesn't affect the image; it just has to sit inside the camera's far clip plane.")]
     public float sphereRadius = 50f;
 
+    [Tooltip("Hide the controllers (models, rays and pointers) except while the picker (A) or the adjustments panel (B) is open, the only times pointing is needed.")]
+    public bool hideControllers = true;
+
     [Header("Compositor layer")]
     [Tooltip("An Equirect composition layer with a Source Textures extension set to Target Eye: Individual. Leave empty to use the sphere only.")]
     public CompositionLayer photoLayer;
@@ -78,6 +85,12 @@ public class VR180Viewer : MonoBehaviour
 
     [Tooltip("Start with the compositor layer switched on.")]
     public bool useLayer = true;
+
+    [Tooltip("Quest: give each eye's layer a single-image swapchain, written once per photo, instead of 3 images " +
+             "reused from photo to photo. Saves about 0.75 GB while viewing, and the old photo's swapchains are freed " +
+             "before the next one is decoded; each photo then gets new swapchains. Needs OpenXR 1.19 or later. " +
+             "Untick for the old way (also chosen automatically for the session if writing keeps failing).")]
+    public bool singleImageSwapchains = true;
 
     [Tooltip("Use the compositor layer on PC (Link, Air Link, Editor) as well as on the Quest. Off by default: " +
              "the PC runtime lacks the stereo equirect layer, so the layer shows in mono wrapped round 360 degrees, " +
@@ -253,6 +266,42 @@ public class VR180Viewer : MonoBehaviour
     [Range(0f, 0.06f)]
     public float thumbnailDepth = 0.015f;
 
+    [Header("Kept photos (quicker switching)")]
+    [Tooltip("Keep the photo you've just left ready, so stepping back to it is instant. Quest: its own pair of layers " +
+             "(about 0.4 GB); PC: its full-size copy (about 0.5 GB of graphics memory). Read at start-up.")]
+    public bool keepPrevious = true;
+
+    [Tooltip("While you look at a photo, prepare the next one in the direction you're going (decoded, and on the Quest " +
+             "written into its own layers out of sight), so stepping on is instant once it's ready (about 2.5 s after the " +
+             "current one appears). Read at start-up.")]
+    public bool preloadNext = true;
+
+    [Tooltip("PC (Link, Air Link, Editor): keep photos as above (each about 0.5 GB of graphics memory at full size). " +
+             "Only used with at least 6 GB of graphics memory.")]
+    public bool keepPhotosOnPC = true;
+
+    [Tooltip("Seconds for the switch to a kept photo: a crossfade of the sharp layers on the Quest, a quick blur through " +
+             "on the sphere otherwise. 0 = at once.")]
+    public float quickSwitchSeconds = 0.35f;
+
+    [Tooltip("Quest: decode the photo being prepared with Android's decoder on its own thread and upload it to the GPU " +
+             "a strip at a time, a frame apart, instead of Unity's decode, which uploads the whole photo in one frame " +
+             "(about 200 ms: a judder while the next photo is prepared). Falls back to Unity's decode if anything fails.")]
+    public bool uploadInStrips = true;
+
+    [Tooltip("Rows per strip for Upload In Strips (a 13,888-wide photo: 128 rows is about 7 MB per frame, 55 strips).")]
+    [Range(16, 1024)]
+    public int stripRows = 128;
+
+    [Tooltip("Tick if photos prepared with Upload In Strips come out upside down (the next photo only: the first one " +
+             "shown, or any reached by a long jump, uses Unity's decode).")]
+    public bool flipStripUpload = false;
+
+    [Tooltip("Quest (experiment): once the next photo's layers are written, show them for a few frames underneath the " +
+             "current photo at a strength too faint to see, so the headset has drawn them once before the switch. " +
+             "Aimed at the tear-like black flicker at the push, if it comes from the first time the headset draws them.")]
+    public bool warmUpPreparedLayers = false;
+
     [Header("Transitions")]
     [Tooltip("Blur each photo away to its average colour, hold that colour while the next one loads, " +
              "then sharpen the next one in. Untick to fade through black instead.")]
@@ -266,6 +315,15 @@ public class VR180Viewer : MonoBehaviour
 
     [Tooltip("Seconds to sharpen the new photo in.")]
     public float blurInSeconds = 0.7f;
+
+    [Tooltip("Quest: seconds to fade the sharp layer in over the sphere, starting with the sharpen-in. " +
+             "The layer is prepared (held invisible) during the colour blend. 0 = the old way: the layer " +
+             "switches on after the sharpen-in has finished.")]
+    public float layerFadeSeconds = 0.4f;
+
+    [Tooltip("Quest: fade the layer by scaling its colour as well as its alpha. Leave off unless the fade " +
+             "looks too dark or too bright half-way (it depends on how the compositor applies the scale).")]
+    public bool layerFadeScalesColour = false;
 
     [Tooltip("Seconds for each half of the fade through black (when Blur Transition is off).")]
     public float fadeSeconds = 0.25f;
@@ -300,6 +358,11 @@ public class VR180Viewer : MonoBehaviour
     int photoGeneration;   // bumped on every photo change, so stale coroutines can tell
     bool busy;
     Transform head;
+    readonly List<Transform> controllerRoots = new List<Transform>();            // see UpdateControllers
+    readonly HashSet<GameObject> controllerParts = new HashSet<GameObject>();    // parts active at the start
+    readonly HashSet<GameObject> controllerPartsLogged = new HashSet<GameObject>();
+    bool controllersFound;
+    bool layerFading;   // the sharp layer is fading in over the sphere (see FadeLayerIn)
     VR180Notice notice;
     readonly HashSet<string> camerasWarned = new HashSet<string>();   // uncalibrated cameras already mentioned this session
     const float CalibrationNoticeSeconds = 9f;
@@ -361,6 +424,9 @@ public class VR180Viewer : MonoBehaviour
     Vector3 parallaxOffset;                        // this frame's eye displacement from turning the head (world)
     bool eyeSourceLogged;
     const string ParallaxKey = "VR180.parallaxDistance";
+    const string QuickSwitchKey = "VR180.quickSwitchSeconds";   // the B panel's Quick switch slider (Inspector value = first-run default)
+    public const float QuickSwitchMin = 0.25f, QuickSwitchMax = 2f;
+    float quickSwitchBeforePanel;
     static readonly int ParallaxId = Shader.PropertyToID("_Parallax");
 
     // Zoom: longitude and latitude scaled by zoom about zoomCentre (photo frame, radians), on the
@@ -487,8 +553,10 @@ public class VR180Viewer : MonoBehaviour
                 VR180StereoEquirectHandler.SetEye(photoLayer, VR180StereoEquirectHandler.Eye.Left);
                 VR180StereoEquirectHandler.SetEye(photoLayerRight, VR180StereoEquirectHandler.Eye.Right);
             }
+            VR180StereoEquirectHandler.StaticSwapchains = singleImageSwapchains;
             VR180StereoEquirectHandler.Install();
         }
+        CreateKeptPhotos();
     }
 
     void OnEnable()
@@ -534,7 +602,9 @@ public class VR180Viewer : MonoBehaviour
         adjustAction.Dispose();
         stickClickAction.Dispose();
         favouriteAction.Dispose();
+        Application.lowMemory -= OnLowMemory;
         FreeLayerTextures();
+        foreach (var k in kept) ReleaseKept(k);
         if (extractMaterial != null) Destroy(extractMaterial);
         if (viewerMaterial != null)
         {
@@ -588,6 +658,7 @@ public class VR180Viewer : MonoBehaviour
         mipBias = PlayerPrefs.GetFloat(MipBiasKey, materialMipBias);
         rollStrength = PlayerPrefs.GetFloat(RollKey, 0.7f);
         parallaxDistance = PlayerPrefs.GetFloat(ParallaxKey, 0f);
+        quickSwitchSeconds = Mathf.Clamp(PlayerPrefs.GetFloat(QuickSwitchKey, quickSwitchSeconds), QuickSwitchMin, QuickSwitchMax);
         viewerMaterial.SetFloat(MipBiasId, mipBias);
         ApplyAdjust(viewerMaterial, adjust);
 
@@ -604,7 +675,7 @@ public class VR180Viewer : MonoBehaviour
 
         Debug.Log($"VR180Viewer: running on {(OnQuest ? "the Quest" : "PC")}; max texture size on this device is {SystemInfo.maxTextureSize}, " +
                   $"system memory {SystemInfo.systemMemorySize} MB, graphics memory {SystemInfo.graphicsMemorySize} MB");
-        Application.lowMemory += () => Debug.LogWarning("VR180Viewer: the system says memory is running low");
+        Application.lowMemory += OnLowMemory;
 
         gameObject.AddComponent<VR180Thumbnails>();
         picker = gameObject.AddComponent<VR180PhotoPicker>();
@@ -725,6 +796,10 @@ public class VR180Viewer : MonoBehaviour
 
     void Update()
     {
+        // A long frame freezes the app (the headset keeps the view steady, but input is only read once a frame)
+        if (Time.unscaledDeltaTime > (busy ? 0.025f : 0.06f) && Time.frameCount > 300)
+            Debug.Log($"VR180Viewer [timing]: a frame took {Time.unscaledDeltaTime * 1000f:F0} ms" +
+                      (prefetchStage != null ? $" (preparing the next photo: {prefetchStage})" : busy ? " (changing photo)" : ""));
         UpdateView();
         CheckWake();
         if (recentreAt >= 0f && Time.unscaledTime >= recentreAt)
@@ -840,8 +915,8 @@ public class VR180Viewer : MonoBehaviour
         if (current != null) UpdateZoom(stick);
         if (adjustAction.WasPressedThisFrame() && current != null) OpenAdjustments();
         else if (favouriteAction.WasPressedThisFrame() && current != null) ToggleFavourite();
-        else if (step > 0 || nextAction.WasPressedThisFrame()) StartCoroutine(Show(index + 1));
-        else if (step < 0 || prevAction.WasPressedThisFrame()) StartCoroutine(Show(index - 1));
+        else if (step > 0 || nextAction.WasPressedThisFrame()) StartCoroutine(Show(index + 1, 1));
+        else if (step < 0 || prevAction.WasPressedThisFrame()) StartCoroutine(Show(index - 1, -1));
     }
 
     // ------------------------------------------------------------------ roll compensation
@@ -1041,6 +1116,9 @@ public class VR180Viewer : MonoBehaviour
     /// Called by the adjustments panel's slider (metres, 0 = off); takes effect at once
     public void SetParallaxDistance(float metres) => parallaxDistance = metres > 0f ? Mathf.Max(metres, 0.5f) : 0f;
 
+    /// The B panel's Quick switch slider: seconds for the crossfade to a photo that was prepared in advance
+    public void SetQuickSwitchSeconds(float seconds) => quickSwitchSeconds = Mathf.Clamp(seconds, QuickSwitchMin, QuickSwitchMax);
+
     /// The layers' radius: the parallax distance when that's on, otherwise the Inspector's (normally 0, infinite)
     float EffectiveLayerRadius => parallaxDistance > 0f ? parallaxDistance : layerRadius;
 
@@ -1133,6 +1211,9 @@ public class VR180Viewer : MonoBehaviour
     {
         if (deleted.Count == 0 || files.Count == 0) return;
         var gone = new HashSet<string>(deleted.Select(p => Path.GetFullPath(p)), StringComparer.OrdinalIgnoreCase);
+        foreach (var k in kept)
+            if (k.path != null && gone.Contains(Path.GetFullPath(k.path))) Evict(k, "deleted");
+        if (currentPath != null && gone.Contains(Path.GetFullPath(currentPath))) currentPath = null;   // never kept as "previous"
         string cur = files[index];
         int before = files.Take(index).Count(f => !gone.Contains(Path.GetFullPath(f)));   // survivors before the current photo
         bool curGone = gone.Contains(Path.GetFullPath(cur));
@@ -1152,6 +1233,7 @@ public class VR180Viewer : MonoBehaviour
         mipBiasBeforePanel = mipBias;
         rollBeforePanel = rollStrength;
         parallaxBeforePanel = parallaxDistance;
+        quickSwitchBeforePanel = quickSwitchSeconds;
         // QooCam photos with a gravity reading (raw ones, and Studio's with the reading copied back in)
         // can have their levelling switched off
         string tilt = null;
@@ -1160,7 +1242,8 @@ public class VR180Viewer : MonoBehaviour
             VR180Fisheye.Tilt(currentInfo.raw, out float pitch, out float roll);
             tilt = $"camera {Mathf.Abs(pitch):0.0}\u00b0 {(pitch >= 0f ? "up" : "down")}, {Mathf.Abs(roll):0.0}\u00b0 {(roll >= 0f ? "right" : "left")}";
         }
-        adjustPanel.Open(head, Path.GetFileName(files[index]), adjust, mipBias, VR180Favourites.IsFavourite(files[index]), rollStrength, parallaxDistance, tilt);
+        adjustPanel.Open(head, Path.GetFileName(files[index]), adjust, mipBias, VR180Favourites.IsFavourite(files[index]), rollStrength, parallaxDistance,
+                        quickSwitchSeconds, tilt);
         Debug.Log("VR180Viewer [adjust]: opened");
     }
 
@@ -1196,6 +1279,12 @@ public class VR180Viewer : MonoBehaviour
             PlayerPrefs.Save();
             string what = parallaxDistance > 0f ? "at " + parallaxDistance.ToString("F1", CultureInfo.InvariantCulture) + " m" : "off";
             Debug.Log($"VR180Viewer [adjust]: head-turn parallax {what}");
+        }
+        if (Mathf.Abs(quickSwitchSeconds - quickSwitchBeforePanel) > 0.001f)
+        {
+            PlayerPrefs.SetFloat(QuickSwitchKey, quickSwitchSeconds);
+            PlayerPrefs.Save();
+            Debug.Log($"VR180Viewer [adjust]: quick switch now {quickSwitchSeconds:F2} s");
         }
         // A photo following the default convergence sets the default for all such photos
         if (!adjust.ownConvergence && Mathf.Abs(adjust.convergence - VR180Adjustments.DefaultConvergence) > 0.001f)
@@ -1241,9 +1330,11 @@ public class VR180Viewer : MonoBehaviour
         busy = true;
         photoGeneration++;   // stops the previous image's coroutines
         string path = files[index];
+        if (prefetching != null) yield return CancelPrefetch();   // it would compete for memory; started again afterwards
         loading.Show();
+        DiscardLayerSwapchains();   // the layer is hidden by now; a new pair is made once the photo is ready
         float t0 = Time.realtimeSinceStartup;
-        using (var req = UnityWebRequestTexture.GetTexture(new Uri(path).AbsoluteUri, true))
+        using (var req = DecodeRequest(path))
         {
             yield return req.SendWebRequest();
             if (req.result != UnityWebRequest.Result.Success)
@@ -1262,6 +1353,7 @@ public class VR180Viewer : MonoBehaviour
         Debug.Log($"VR180Viewer [layer]: layer rebuilt in {Time.realtimeSinceStartup - t0:F2}s");
         if (useLayer && !PanelOpen) ShowLayer();
         busy = false;
+        PlanKept();
     }
 
     // Diagnostic: the Quest stops sending controller input to an app that has lost focus
@@ -1271,6 +1363,53 @@ public class VR180Viewer : MonoBehaviour
     {
         Debug.Log($"VR180Viewer: application {(paused ? "paused" : "resumed")}");
         if (!paused) StartCoroutine(CheckLayerAfterResume());
+    }
+
+    // The controllers are only needed for pointing at the picker and the adjustments panel. The rest of
+    // the time they're hidden: over the Quest's sharp layer they vanish anyway, and over the sphere they
+    // would pop up wherever the hands happen to be. Hidden by switching off what hangs under each
+    // controller (model, Near-Far ray, poke pointer), so the rays can't touch anything either; the
+    // controllers themselves keep tracking, and the buttons work as before (their actions are separate).
+    // Checked every frame: the template's ControllerInputActionManager switches the Teleport Interactor
+    // (with its own line) on whenever a thumbstick is pushed up or down, i.e. when zooming or scrolling.
+    // Parts that were off at the start (teleport) are kept off even while a panel is open.
+    void UpdateControllers()
+    {
+        if (head == null) return;
+        if (!controllersFound)
+        {
+            controllersFound = true;
+            // The template's XR Origin: Camera Offset holds Main Camera, Left Controller and Right Controller
+            Transform offset = head.parent;
+            var names = new List<string>();
+            if (offset != null)
+                foreach (Transform c in offset)
+                    if (c != head && c.name.EndsWith("Controller"))
+                    {
+                        controllerRoots.Add(c);
+                        foreach (Transform part in c)
+                            if (part.gameObject.activeSelf) { controllerParts.Add(part.gameObject); names.Add($"{c.name}/{part.name}"); }
+                    }
+            Debug.Log(controllerRoots.Count > 0
+                ? $"VR180Viewer: controller parts shown only with a panel open: {string.Join(", ", names)}; everything else under the controllers kept off"
+                : "VR180Viewer: no controllers found under the camera's parent, so they can't be hidden");
+        }
+        if (!hideControllers) return;
+        bool panel = (picker != null && picker.IsOpen) || (adjustPanel != null && adjustPanel.IsOpen);
+        foreach (Transform root in controllerRoots)
+        {
+            if (root == null) continue;
+            foreach (Transform part in root)
+            {
+                GameObject go = part.gameObject;
+                bool want = panel && controllerParts.Contains(go);
+                if (go.activeSelf == want) continue;
+                // Something else switched it on (most likely the teleport pointer): say so once
+                if (go.activeSelf && !controllerParts.Contains(go) && controllerPartsLogged.Add(go))
+                    Debug.Log($"VR180Viewer: {root.name}/{go.name} was switched on by something else; keeping it off");
+                go.SetActive(want);
+            }
+        }
     }
 
     bool PanelOpen => framing || (picker != null && picker.IsOpen) || (adjustPanel != null && adjustPanel.IsOpen);
@@ -1286,6 +1425,7 @@ public class VR180Viewer : MonoBehaviour
     {
         sessionLost = true;
         HideLayer();
+        foreach (var k in kept) Evict(k, "the XR session ended, taking the layers' images with it");
         Debug.Log("VR180Viewer [layer]: the XR session ended (headset asleep?); the sphere shows the photo until the layer is rebuilt");
     }
 
@@ -1405,6 +1545,7 @@ public class VR180Viewer : MonoBehaviour
 
     void LateUpdate()
     {
+        UpdateControllers();   // late, so anything the XR template switched on this frame is caught before rendering
         // Only matters if the layer has a finite radius: keep its centre at the head
         if (photoLayer != null && photoLayer.gameObject.activeSelf) UpdateLayerPose();
     }
@@ -1442,10 +1583,13 @@ public class VR180Viewer : MonoBehaviour
         }
     }
 
-    IEnumerator Show(int i)
+    // step: +1 = next, -1 = previous, 0 = anything else (the direction of travel is then unchanged)
+    IEnumerator Show(int i, int step = 0)
     {
         busy = true;
         photoGeneration++;
+        float tPush = Time.realtimeSinceStartup;
+        if (step != 0) lastStep = step;
         // A shuffled favourites slideshow that has shown every photo: shuffle again and carry on
         if (shufflingFavourites && i >= files.Count && files.Count > 1)
         {
@@ -1457,6 +1601,48 @@ public class VR180Viewer : MonoBehaviour
         index = ((i % files.Count) + files.Count) % files.Count;
         string path = files[index];
         if (shufflingFavourites) SaveShuffle(index);
+
+        // Kept photos: the one wanted may be ready already (no decode), or being prepared (wait for it)
+        if (KeepingOn && !Same(path, currentPath))
+        {
+            Kept k = FindKept(path);
+            if (k != null && k == prefetching)
+            {
+                prefetchUrgent = true;
+                float tw = Time.realtimeSinceStartup;
+                if (!k.decoded)
+                {
+                    // Still decoding: let it be seen that something's happening (the sharp layer would hide the dots)
+                    HideLayer();
+                    if (!blurTransition) { if (viewerMaterial.GetFloat(FadeId) > 0.5f) yield return Fade(0f); }
+                    else if (current != null && viewerMaterial.GetFloat(HoldMixId) < 0.5f)
+                    {
+                        yield return Animate(BlurId, 1f, blurOutSeconds);
+                        Graphics.CopyTexture(current, 0, current.mipmapCount - 1, holdTex, 0, 0);
+                        viewerMaterial.SetFloat(HoldMixId, 1f);
+                    }
+                    loading.Show();
+                }
+                while (prefetching == k) yield return null;
+                loading.Hide();
+                prefetchUrgent = false;
+                Debug.Log($"VR180Viewer [kept]: waited {Time.realtimeSinceStartup - tw:F2}s for {Path.GetFileName(path)} to finish being prepared");
+            }
+            if (k != null && k.ready && Same(k.path, path) && KeptStillGood(k))
+            {
+                yield return SwitchToKept(k, tPush);
+                yield break;
+            }
+        }
+        // Not kept: decode it. Anything being prepared is stopped first (it would compete for memory)
+        if (prefetching != null) yield return CancelPrefetch();
+
+        // Start decoding the new photo at once, so the decode overlaps the old photo's blur-out
+        // instead of waiting for it (on the Quest the old photo's sphere copy is only quarter
+        // size, so having both at once costs little memory). Disposed by the using block below.
+        float t0 = Time.realtimeSinceStartup;
+        UnityWebRequest pending = DecodeRequest(path);
+        UnityWebRequestAsyncOperation decoding = pending.SendWebRequest();   // JPEG decoding happens off the main thread
 
         HideLayer();
         if (blurTransition)
@@ -1477,6 +1663,9 @@ public class VR180Viewer : MonoBehaviour
         ResetZoom();         // each photo starts unzoomed (the old one has blurred away by now)
         yield return null;   // make sure the held frame is on screen before the heavy work
 
+        // Keep the photo being left (its layers already hold it), unless it isn't wanted or can't be
+        RetireCurrent(path);
+
         loading.Show();
         currentInfo = ReadMetadata(path);
         adjust = VR180Adjustments.Get(path);   // baked into the layer; applied to the sphere below
@@ -1486,11 +1675,14 @@ public class VR180Viewer : MonoBehaviour
         // and destroying them while it does makes it fail on every frame.)
         viewerMaterial.SetTexture(MainTexId, null);
         if (current != null) { current.Release(); Destroy(current); current = null; }
+        currentPath = null;
+        // Single-image swapchains (Quest): the old photo's are spent anyway, so free them before the decode's peak
+        DiscardLayerSwapchains();
 
-        float t0 = Time.realtimeSinceStartup;
-        using (var req = UnityWebRequestTexture.GetTexture(new Uri(path).AbsoluteUri, true))
+        float tWait = Time.realtimeSinceStartup;   // the blur-out is over; anything after this is waiting for the decode
+        using (var req = pending)
         {
-            yield return req.SendWebRequest();   // JPEG decoding happens off the main thread
+            if (!decoding.isDone) yield return decoding;
             if (req.result != UnityWebRequest.Result.Success)
             {
                 Debug.LogError($"VR180Viewer: failed to load {path}: {req.error}");
@@ -1514,21 +1706,19 @@ public class VR180Viewer : MonoBehaviour
             current = MakeMipmapped(src, layerWanted ? sphereHalvingsWithLayer : 0, currentInfo.fisheye, currentInfo.raw);
             Destroy(src);
             BakeFillMaps();
+            currentPath = path;
         }
         yield return null;   // let the decoded photo's memory be freed before the layer starts up
         loading.Hide();
 
         Debug.Log($"VR180Viewer: {Path.GetFileName(path)} {current.width}x{current.height}, " +
                   $"{(currentInfo.sideBySide ? "side-by-side" : "mono")}, " +
-                  $"loaded in {Time.realtimeSinceStartup - t0:F2}s");
+                  $"loaded in {Time.realtimeSinceStartup - t0:F2}s from the push " +
+                  $"({Time.realtimeSinceStartup - tWait:F2}s of it after the blur-out)");
 
-        viewerMaterial.SetTexture(MainTexId, current);
-        ApplyAdjust(viewerMaterial, adjust);
+        ApplySphere();
         // A discreet corner star (seen while it sharpens in), but not in the Favourites slideshow
         if (!viewingFavourites && VR180Favourites.IsFavourite(path)) badge.Corner();
-        viewerMaterial.SetVector(CoverageId, currentInfo.coverage);
-        viewerMaterial.SetFloat(StereoId, currentInfo.sideBySide ? 1f : 0f);
-        viewerMaterial.SetFloat(MaxMipId, Mathf.Floor(Mathf.Log(Mathf.Max(current.width, current.height), 2f)));
         // Only the first photo is centred on where you're looking; after that every photo appears
         // in the same place, and recentring is left to the headset (or the thumbstick hold)
         if (!centredOnce) { Recentre(); centredOnce = true; }
@@ -1537,11 +1727,21 @@ public class VR180Viewer : MonoBehaviour
         // that way, timed to finish within the sharpen-in (the layer covers it on the Quest)
         ShowTiltHint(blurTransition ? colourBlendSeconds + blurInSeconds : 1f);
 
+        // Quest: switch the sharp layer on now but invisible (alpha 0), so the headset's swapchains are
+        // written during the colour blend; it then fades in over the sphere as the sharpen-in starts.
+        // Not when the calibration notice is due (the layer would cover it).
+        bool calibrationNoticeDue = currentInfo.fisheye && currentInfo.raw.calibrationProblem != null && notice != null &&
+                                    !camerasWarned.Contains(currentInfo.raw.serial ?? "");
+        bool fadeLayer = useLayer && blurTransition && layerFadeSeconds > 0f && StereoLayers &&
+                         VR180StereoEquirectHandler.ColourScaleSupported && !calibrationNoticeDue && !PanelOpen && LayerReady;
+        if (fadeLayer) ShowLayer(fadeIn: true);
+
         // Bring the new photo in on the sphere, then hand over to the sharper layer
         if (blurTransition)
         {
             viewerMaterial.SetFloat(BlurId, 1f);
             yield return Animate(HoldMixId, 0f, colourBlendSeconds);   // old average -> new average
+            if (fadeLayer) StartCoroutine(FadeLayerIn(photoGeneration));
             yield return Animate(BlurId, 0f, blurInSeconds);           // then sharpen
         }
         else
@@ -1557,10 +1757,697 @@ public class VR180Viewer : MonoBehaviour
             while (notice.Visible) yield return null;
         }
 
-        if (useLayer) ShowLayer();
+        if (useLayer && !fadeLayer) ShowLayer();
         busy = false;
         // The picker's thumbnail, if it hasn't one yet: almost free from the copy just made
         VR180Thumbnails.FromViewed(path, current, currentInfo.coverage, currentInfo.sideBySide, PhotoTilt);
+        PlanKept();   // start preparing the next photo
+    }
+
+    // ------------------------------------------------------------------ kept photos (19 November 2026)
+    //
+    // Besides the photo on view, up to two more are kept ready: the one just left (Keep Previous) and the
+    // next one in the direction you're going (Preload Next), prepared while you look at the current one.
+    // On the Quest each has its own pair of layers (clones of Photo Layer and Photo Layer Right) whose
+    // single-image swapchains already hold it, written out of sight (the handler's SetHeld), plus its
+    // quarter-size sphere copy and fill maps; on PC just its full-size sphere copy. Switching to a kept
+    // photo is a crossfade between the two pairs (Quick Switch Seconds), with no decode.
+    //
+    // The current photo lives in the viewer's usual fields (photoLayer, current, currentInfo and so on);
+    // a Kept holds the same things for another photo, and SwapWithCurrent exchanges the two, so the rest
+    // of the viewer only ever deals with "the current photo" as before. The layer pairs move between them.
+
+    class Kept
+    {
+        public string path;                 // null = free
+        public bool ready;                  // holds the photo, ready to show
+        public bool preparing, decoded;     // being prepared (Prefetch); its JPEG has been decoded
+        public CompositionLayer left, right;
+        public TexturesExtension texL, texR;
+        public Texture eyeL, eyeR;          // only while its layers are being written
+        public RenderTexture sphere;
+        public readonly RenderTexture[] fill = new RenderTexture[2];
+        public PhotoInfo info;
+        public VR180Adjustments.Values adjust;
+        public float bakeZoom = 1f;
+        public Vector2 bakeCentre;
+    }
+
+    readonly List<Kept> kept = new List<Kept>();
+    bool keptWithLayers;     // the Quest: each Kept has its own pair of layers
+    string currentPath;      // the photo in the current fields (null = none)
+    string previousPath;     // the photo shown before it
+    int lastStep = 1;        // the direction of travel: +1 next, -1 previous
+    Kept prefetching;        // the one being prepared, if any
+    bool prefetchCancel;     // asks Prefetch to stop
+    bool prefetchUrgent;     // the photo being prepared has been asked for: no waiting for a quiet moment
+    int keepLevel = 2;       // 2 = previous and next, 1 = next only, 0 = none (stepped down on low memory)
+    string prefetchStage;    // what Prefetch is doing this frame, for the [timing] log
+    bool deferLayerImages;   // BuildLayerTextures: make the eye textures but don't give them to the layers yet
+    const int WarmUpFrames = 10;
+    const int OrderBase = 20000;   // the scene pair's order at start; incoming pairs go below (PutBelowAll)
+
+    bool CanKeepLayers => StereoLayers && VR180StereoEquirectHandler.StaticSwapchains;
+    bool KeepingOn => kept.Count > 0 && keepLevel > 0 && (!keptWithLayers || CanKeepLayers);
+
+    static bool Same(string a, string b) => a != null && b != null && SamePath(a, b);
+    Kept FindKept(string path) => path == null ? null : kept.FirstOrDefault(k => Same(k.path, path));
+
+    void CreateKeptPhotos()
+    {
+        int extra = (keepPrevious ? 1 : 0) + (preloadNext ? 1 : 0);
+        if (extra == 0) return;
+        if (OnQuest)
+        {
+            if (photoLayer == null || photoLayerRight == null || layerTextures == null || layerTexturesRight == null) return;
+            // Orders start high: each incoming pair is put below all the others (PutBelowAll), so they count down
+            photoLayer.Order = OrderBase;
+            photoLayerRight.Order = OrderBase + 1;
+            var orders = new List<string>();
+            for (int n = 1; n <= extra; n++)
+            {
+                var k = new Kept
+                {
+                    left = CloneLayer(photoLayer, photoLayer.Order + 10 * n, $" (kept {n})"),
+                    right = CloneLayer(photoLayerRight, photoLayerRight.Order + 10 * n, $" (kept {n})")
+                };
+                k.texL = k.left.GetComponent<TexturesExtension>();
+                k.texR = k.right.GetComponent<TexturesExtension>();
+                VR180StereoEquirectHandler.SetEye(k.left, VR180StereoEquirectHandler.Eye.Left);
+                VR180StereoEquirectHandler.SetEye(k.right, VR180StereoEquirectHandler.Eye.Right);
+                kept.Add(k);
+                orders.Add($"{k.left.Order}/{k.right.Order}");
+            }
+            keptWithLayers = true;
+            Debug.Log($"VR180Viewer [kept]: {extra} extra pair(s) of photo layers made (orders {string.Join(", ", orders)}; " +
+                      $"the scene's pair is {photoLayer.Order}/{photoLayerRight.Order})");
+        }
+        else if (photoLayer == null && keepPhotosOnPC)
+        {
+            if (SystemInfo.graphicsMemorySize < 6000)
+            {
+                Debug.Log($"VR180Viewer [kept]: only {SystemInfo.graphicsMemorySize} MB of graphics memory, so no photos are kept on PC");
+                return;
+            }
+            for (int n = 0; n < extra; n++) kept.Add(new Kept());
+            Debug.Log($"VR180Viewer [kept]: up to {extra} photo(s) kept at full size besides the current one (about 0.5 GB of graphics memory each)");
+        }
+    }
+
+    static CompositionLayer CloneLayer(CompositionLayer template, int order, string suffix)
+    {
+        var go = Instantiate(template.gameObject, template.transform.parent);
+        go.name = template.gameObject.name + suffix;
+        go.SetActive(false);
+        var layer = go.GetComponent<CompositionLayer>();
+        layer.Order = order;
+        return layer;
+    }
+
+    // Exchanges the current photo (the viewer's fields) with a kept one
+    void SwapWithCurrent(Kept k)
+    {
+        (photoLayer, k.left) = (k.left, photoLayer);
+        (photoLayerRight, k.right) = (k.right, photoLayerRight);
+        (layerTextures, k.texL) = (k.texL, layerTextures);
+        (layerTexturesRight, k.texR) = (k.texR, layerTexturesRight);
+        (layerLeft, k.eyeL) = (k.eyeL, layerLeft);
+        (layerRight, k.eyeR) = (k.eyeR, layerRight);
+        (current, k.sphere) = (k.sphere, current);
+        (fillMaps[0], k.fill[0]) = (k.fill[0], fillMaps[0]);
+        (fillMaps[1], k.fill[1]) = (k.fill[1], fillMaps[1]);
+        (currentInfo, k.info) = (k.info, currentInfo);
+        (adjust, k.adjust) = (k.adjust, adjust);
+        (layerBakeZoom, k.bakeZoom) = (k.bakeZoom, layerBakeZoom);
+        (layerBakeCentre, k.bakeCentre) = (k.bakeCentre, layerBakeCentre);
+        (currentPath, k.path) = (k.path, currentPath);
+    }
+
+    // Points the sphere's material at the current photo
+    void ApplySphere()
+    {
+        viewerMaterial.SetTexture(MainTexId, current);
+        ApplyAdjust(viewerMaterial, adjust);
+        viewerMaterial.SetVector(CoverageId, currentInfo.coverage);
+        viewerMaterial.SetFloat(StereoId, currentInfo.sideBySide ? 1f : 0f);
+        if (current != null)
+            viewerMaterial.SetFloat(MaxMipId, Mathf.Floor(Mathf.Log(Mathf.Max(current.width, current.height), 2f)));
+        viewerMaterial.SetTexture(FillMap0Id, fillMaps[0]);
+        viewerMaterial.SetTexture(FillMap1Id, fillMaps[1]);
+        viewerMaterial.SetFloat(FillMapSizeId, useFillMaps && fillMaps[0] != null ? FillMapSize : 0f);
+    }
+
+    // Puts a pair of layers above all the other photo layers. Only ever used on a pair that isn't on view.
+    void PutAboveAll(CompositionLayer l, CompositionLayer r, string why)
+    {
+        int high = int.MinValue;
+        foreach (var layer in new[] { photoLayer, photoLayerRight })
+            if (layer != null && layer != l && layer != r) high = Mathf.Max(high, layer.Order);
+        foreach (var k in kept)
+            foreach (var layer in new[] { k.left, k.right })
+                if (layer != null && layer != l && layer != r) high = Mathf.Max(high, layer.Order);
+        if (high == int.MinValue || Mathf.Min(l.Order, r.Order) > high) return;   // already on top
+        l.Order = high + 1;
+        r.Order = high + 2;
+        Debug.Log($"VR180Viewer [kept]: {l.name} and {r.name} put on top at orders {l.Order}/{r.Order} ({why})");
+    }
+
+    // Puts a pair of layers below all the other photo layers (still above the eye buffer, order 0). Only ever
+    // used on a pair that isn't on view: changing the order of one on view made the headset drop it for a moment.
+    void PutBelowAll(CompositionLayer l, CompositionLayer r, string why)
+    {
+        int low = int.MaxValue;
+        foreach (var layer in new[] { photoLayer, photoLayerRight })
+            if (layer != null && layer != l && layer != r) low = Mathf.Min(low, layer.Order);
+        foreach (var k in kept)
+            foreach (var layer in new[] { k.left, k.right })
+                if (layer != null && layer != l && layer != r) low = Mathf.Min(low, layer.Order);
+        if (low == int.MaxValue || Mathf.Max(l.Order, r.Order) < low) return;   // already underneath
+        if (low - 2 < 1) { Debug.LogWarning($"VR180Viewer [kept]: no orders left below {low} for {l.name}; leaving it"); return; }
+        l.Order = low - 2;
+        r.Order = low - 1;
+        Debug.Log($"VR180Viewer [kept]: {l.name} and {r.name} put underneath at orders {l.Order}/{r.Order} ({why})");
+    }
+
+    // The JPEG decode used everywhere a photo is shown: no mip chain (the decoded photo is only ever copied at or
+    // below full size, by exact halvings, so mips were never used: they cost about 128 MB and time in the frame
+    // the decoded photo arrives in, which was the judder and the low-memory warning), and not readable by script
+    static UnityWebRequest DecodeRequest(string path)
+    {
+        var p = DownloadedTextureParams.Default;
+        p.readable = false;
+        p.mipmapChain = false;
+        return UnityWebRequestTexture.GetTexture(new Uri(path), p);
+    }
+
+    // One pair's fade; switchSphere: the surround (sphere) changes to the current photo half-way
+    IEnumerator FadePair(CompositionLayer l, CompositionLayer r, float from, float to, float seconds, bool switchSphere)
+    {
+        bool switched = !switchSphere;
+        for (float t = 0f; t < seconds; t += Time.deltaTime)
+        {
+            SetPairAlpha(l, r, Mathf.Lerp(from, to, Mathf.SmoothStep(0f, 1f, t / seconds)));
+            if (!switched && t >= seconds * 0.5f) { ApplySphere(); switched = true; }
+            yield return null;
+        }
+        SetPairAlpha(l, r, to);
+        if (!switched) ApplySphere();
+    }
+
+    static void SetPairAlpha(CompositionLayer l, CompositionLayer r, float a)
+    {
+        VR180StereoEquirectHandler.SetAlpha(l, a);
+        VR180StereoEquirectHandler.SetAlpha(r, a);
+    }
+
+    // Frees what a Kept holds (its layers stay, switched off); no coroutines, so safe in OnDestroy
+    void ReleaseKept(Kept k)
+    {
+        k.path = null;
+        k.ready = k.preparing = k.decoded = false;
+        foreach (var layer in new[] { k.left, k.right })
+        {
+            if (layer == null) continue;   // (also when already destroyed, at shutdown)
+            layer.gameObject.SetActive(false);
+            VR180StereoEquirectHandler.SetHeld(layer, true);   // never submitted until deliberately shown
+            VR180StereoEquirectHandler.SetAlpha(layer, 1f);
+            VR180StereoEquirectHandler.ReleaseImage(layer);
+        }
+        FreeKeptEyeTextures(k);
+        if (k.sphere != null) { DestroyTexture(k.sphere); k.sphere = null; }
+        for (int e = 0; e < 2; e++)
+            if (k.fill[e] != null) { DestroyTexture(k.fill[e]); k.fill[e] = null; }
+        k.bakeZoom = 1f;
+    }
+
+    void FreeKeptEyeTextures(Kept k)
+    {
+        if (k.texL != null) { k.texL.LeftTexture = null; k.texL.RightTexture = null; }
+        if (k.texR != null) { k.texR.LeftTexture = null; k.texR.RightTexture = null; }
+        if (k.eyeR != null && k.eyeR != k.eyeL) DestroyTexture(k.eyeR);
+        if (k.eyeL != null) DestroyTexture(k.eyeL);
+        k.eyeL = k.eyeR = null;
+    }
+
+    // Lets go of a kept photo: textures freed now, its single-image swapchains as soon as the handler allows
+    void Evict(Kept k, string why)
+    {
+        if (k == null) return;
+        if (k == prefetching) { prefetchCancel = true; return; }   // Prefetch tidies up after itself
+        string name = k.path != null ? Path.GetFileName(k.path) : null;
+        ReleaseKept(k);
+        if (k.left != null && k.right != null) StartCoroutine(DiscardSoon(k.left, k.right));
+        if (name != null) Debug.Log($"VR180Viewer [kept]: {name} let go ({why})");
+    }
+
+    IEnumerator DiscardSoon(CompositionLayer l, CompositionLayer r)
+    {
+        int serialL = VR180StereoEquirectHandler.ImageSerial(l), serialR = VR180StereoEquirectHandler.ImageSerial(r);
+        for (int f = 0; f < 30; f++)
+        {
+            // Given a new photo meanwhile: that replaces the swapchain anyway
+            if (VR180StereoEquirectHandler.ImageSerial(l) != serialL || VR180StereoEquirectHandler.ImageSerial(r) != serialR) yield break;
+            if (l.gameObject.activeSelf || r.gameObject.activeSelf) yield break;
+            bool doneL = VR180StereoEquirectHandler.DiscardSwapchain(l);
+            bool doneR = VR180StereoEquirectHandler.DiscardSwapchain(r);
+            if (doneL && doneR) yield break;
+            yield return null;
+        }
+    }
+
+    /// The photo ahead in the direction of travel (null if there isn't one to prepare)
+    string AheadPath()
+    {
+        if (files.Count < 2) return null;
+        int j = index + lastStep;
+        if (shufflingFavourites && j >= files.Count) return null;   // the slideshow reshuffles there
+        j = ((j % files.Count) + files.Count) % files.Count;
+        return files[j];
+    }
+
+    // Cold path, just before a new photo is decoded: keep the photo being left (its layers already hold it)
+    // in a free Kept, so the current fields are free for the new one. Everything else kept, except the
+    // photo ahead, is let go first, to keep the decode's peak memory down.
+    void RetireCurrent(string newPath)
+    {
+        string leaving = currentPath;
+        if (leaving != null && !Same(leaving, newPath)) previousPath = leaving;
+        if (!KeepingOn) return;
+        string ahead = preloadNext ? AheadPath() : null;
+        foreach (var k in kept)
+            if (k.path != null && !Same(k.path, ahead)) Evict(k, "making room for the photo being loaded");
+
+        string why = null;
+        if (!keepPrevious || keepLevel < 2) why = "";
+        else if (leaving == null || current == null || Same(leaving, newPath)) why = "";
+        else if (layerBakeZoom != 1f) why = "it has a telephoto zoom baked into its layers";
+        else if (photoLayer != null && (layerLeft != null || !VR180StereoEquirectHandler.HasImage(photoLayer) ||
+                                        !VR180StereoEquirectHandler.HasImage(photoLayerRight)))
+            why = "its layers weren't fully written yet";
+        Kept free = why == null ? kept.FirstOrDefault(k => k.path == null) : null;
+        if (why == null && free == null) why = "no room";
+        if (why != null)
+        {
+            if (why.Length > 0) Debug.Log($"VR180Viewer [kept]: {Path.GetFileName(leaving)} not kept ({why})");
+            return;
+        }
+        if (photoLayer != null) SetPairAlpha(photoLayer, photoLayerRight, 1f);
+        SwapWithCurrent(free);   // the current fields now hold free's empty layers, ready for the new photo
+        free.ready = true;
+        Debug.Log($"VR180Viewer [kept]: {Path.GetFileName(free.path)} kept, so going back to it is instant");
+    }
+
+    // After a photo is shown: let go of anything no longer next to it, and start preparing the one ahead
+    void PlanKept()
+    {
+        if (!KeepingOn)
+        {
+            // (for example the handler went back to multi-image swapchains, or memory is low)
+            foreach (var k in kept) if (k.path != null) Evict(k, "photos aren't being kept just now");
+            return;
+        }
+        if (currentPath == null || files.Count < 2) return;
+        string ahead = preloadNext ? AheadPath() : null;
+        string behind = keepPrevious && keepLevel >= 2 ? previousPath : null;
+        if (Same(ahead, currentPath)) ahead = null;
+        foreach (var k in kept)
+            if (k.path != null && k != prefetching && !Same(k.path, ahead) && !Same(k.path, behind))
+                Evict(k, "no longer next to the photo on view");
+        if (prefetching != null && !Same(prefetching.path, ahead)) prefetchCancel = true;
+        if (ahead == null || FindKept(ahead) != null) return;
+        Kept free = kept.FirstOrDefault(k => k.path == null && k != prefetching);
+        if (free == null) return;
+        StartCoroutine(Prefetch(free, ahead));
+    }
+
+    IEnumerator CancelPrefetch()
+    {
+        if (prefetching == null) yield break;
+        prefetchCancel = true;
+        float t0 = Time.realtimeSinceStartup;
+        while (prefetching != null && Time.realtimeSinceStartup - t0 < 2f) yield return null;
+    }
+
+    void EndPrefetch(Kept k, string why)
+    {
+        prefetchStage = null;
+        if (prefetching == k) prefetching = null;
+        prefetchCancel = false;
+        k.preparing = false;
+        Evict(k, why);
+    }
+
+    // Prepares a photo in a free Kept while the current one is on view: decoded, its sphere copy and fill
+    // maps made, and (Quest) its own layers switched on but held, so that their single images are written
+    // without being shown; then the layers are switched off again and the eye textures freed.
+    IEnumerator Prefetch(Kept k, string path)
+    {
+        prefetching = k;
+        prefetchCancel = false;
+        k.path = path;
+        k.ready = k.decoded = false;
+        k.preparing = true;
+        string name = Path.GetFileName(path);
+
+        // Wait for a quiet moment: the current photo settled (its eye textures freed), nothing else going on
+        float tQuiet = Time.realtimeSinceStartup;
+        while (!prefetchUrgent && (busy || PanelOpen || layerFading || zoomChanging ||
+                                   (layerLeft != null && Time.realtimeSinceStartup - tQuiet < 5f)))
+        {
+            if (prefetchCancel) { EndPrefetch(k, "cancelled"); yield break; }
+            yield return null;
+        }
+
+        PhotoInfo info = ReadMetadata(path);
+        if (info.fisheye && info.raw.calibrationProblem != null && notice != null && !camerasWarned.Contains(info.raw.serial ?? ""))
+        {
+            EndPrefetch(k, "its camera's calibration notice hasn't been shown yet");
+            yield break;
+        }
+        var adj = VR180Adjustments.Get(path);
+        float t0 = Time.realtimeSinceStartup;
+        Texture src = null;
+        string stripNote = "";
+        if (uploadInStrips && VR180StripDecoder.Available)
+        {
+            // Android decodes it on its own thread; the upload is spread over many frames (paused while a
+            // fade or zoom is running, hurried if the photo has already been asked for)
+            var sr = new VR180StripDecoder.Result();
+            prefetchStage = "uploading the photo in strips";
+            yield return VR180StripDecoder.Load(path, stripRows, flipStripUpload,
+                () => prefetchUrgent ? 8 : (layerFading || zoomChanging || busy) ? 0 : 1,
+                () => prefetchCancel, sr);
+            if (sr.cancelled || prefetchCancel)
+            {
+                if (sr.texture != null) Destroy(sr.texture);
+                EndPrefetch(k, "cancelled while decoding");
+                yield break;
+            }
+            if (sr.texture != null)
+            {
+                src = sr.texture;
+                stripNote = $" (Android's decode {sr.decodeSeconds:F2}s, then {sr.strips} strips uploaded over {sr.frames} frames " +
+                            $"in {sr.uploadSeconds:F2}s, {sr.totalMs / Mathf.Max(1, sr.frames):F1} ms a frame on average, worst {sr.worstMs:F0} ms)";
+            }
+            else Debug.LogWarning($"VR180Viewer [strips]: {name}: {sr.error}; using Unity's decode instead");
+        }
+        if (src == null)
+        using (var req = DecodeRequest(path))
+        {
+            UnityWebRequestAsyncOperation op = req.SendWebRequest();   // decoded off the main thread
+            while (!op.isDone)
+            {
+                if (prefetchCancel) { req.Abort(); EndPrefetch(k, "cancelled while decoding"); yield break; }
+                yield return null;
+            }
+            if (req.result != UnityWebRequest.Result.Success)
+            {
+                EndPrefetch(k, $"couldn't load it: {req.error}");
+                yield break;
+            }
+            prefetchStage = "the decoded photo arriving";
+            src = DownloadHandlerTexture.GetContent(req);
+        }
+        k.decoded = true;
+        yield return null;   // (so the [timing] log tells this frame from the next step's)
+        float decodeSeconds = Time.realtimeSinceStartup - t0;
+        if (info.fisheye && !VR180Fisheye.PlausibleSize(src.width, src.height)) info.fisheye = false;
+
+        // Built in steps, a frame or more apart, so that no one frame has too much to do (a frame that takes
+        // too long freezes the app: the view still follows the head, but a quick push of the stick is missed).
+        // The swapchains, the slowest part when memory is short, come last, once the decoded photo is freed.
+        bool layered = k.left != null;
+        float buildMs = 0f;
+        for (int step = 0; step < 2; step++)
+        {
+            while (!prefetchUrgent && (layerFading || zoomChanging || busy) && !prefetchCancel) yield return null;
+            if (prefetchCancel) { Destroy(src); EndPrefetch(k, "cancelled"); yield break; }
+            float tStep = Time.realtimeSinceStartup;
+            if (step == 0)
+            {
+                prefetchStage = "its layers' eye textures";
+                if (layered) BuildKept(k, src, info, adj, layers: true);
+            }
+            else
+            {
+                prefetchStage = "its sphere copy";
+                BuildKept(k, src, info, adj, layers: false);
+                Destroy(src);
+                src = null;
+            }
+            buildMs += (Time.realtimeSinceStartup - tStep) * 1000f;
+            yield return null;
+        }
+        for (int f = 0; f < 3; f++) yield return null;   // the decoded photo's memory back first
+
+        float writeSeconds = 0f;
+        if (layered)
+        {
+            while (!prefetchUrgent && (layerFading || zoomChanging || busy) && !prefetchCancel) yield return null;
+            if (prefetchCancel) { EndPrefetch(k, "cancelled"); yield break; }
+            prefetchStage = "its layers' swapchains";
+            VR180StereoEquirectHandler.SetImage(k.left, k.eyeL);
+            VR180StereoEquirectHandler.SetImage(k.right, k.eyeR);
+            VR180StereoEquirectHandler.SetHeld(k.left, true);
+            VR180StereoEquirectHandler.SetHeld(k.right, true);
+            SetPairAlpha(k.left, k.right, 1f);
+            k.left.gameObject.SetActive(true);
+            k.right.gameObject.SetActive(true);
+            float tw = Time.realtimeSinceStartup;
+            while (!(VR180StereoEquirectHandler.IsResident(k.left) && VR180StereoEquirectHandler.IsResident(k.right)))
+            {
+                if (prefetchCancel) { prefetchStage = null; EndPrefetch(k, "cancelled while writing its layers"); yield break; }
+                if (Time.realtimeSinceStartup - tw > 10f) { prefetchStage = null; EndPrefetch(k, "its layers were never written"); yield break; }
+                yield return null;
+            }
+            writeSeconds = Time.realtimeSinceStartup - tw;
+            if (warmUpPreparedLayers)
+            {
+                // Drawn once by the headset before the switch: underneath the current photo, at 1% strength
+                prefetchStage = "warming its layers";
+                PutBelowAll(k.left, k.right, "the pair being warmed, held");
+                SetPairAlpha(k.left, k.right, 0.01f);
+                VR180StereoEquirectHandler.SetHeld(k.left, false);
+                VR180StereoEquirectHandler.SetHeld(k.right, false);
+                for (int f = 0; f < WarmUpFrames; f++)
+                {
+                    if (prefetchCancel) break;
+                    yield return null;
+                }
+                VR180StereoEquirectHandler.SetHeld(k.left, true);
+                VR180StereoEquirectHandler.SetHeld(k.right, true);
+                SetPairAlpha(k.left, k.right, 1f);
+                if (prefetchCancel) { prefetchStage = null; EndPrefetch(k, "cancelled while warming its layers"); yield break; }
+                Debug.Log($"VR180Viewer [kept]: {name}'s layers drawn faintly underneath for {WarmUpFrames} frames " +
+                          $"(orders {k.left.Order}/{k.right.Order} under {photoLayer.Order}/{photoLayerRight.Order})");
+            }
+            // Switched off but left held: only showing it (SwitchToKept, ShowLayer) lets it be submitted
+            k.left.gameObject.SetActive(false);
+            k.right.gameObject.SetActive(false);
+            VR180StereoEquirectHandler.ReleaseImage(k.left);
+            VR180StereoEquirectHandler.ReleaseImage(k.right);
+            FreeKeptEyeTextures(k);
+        }
+        prefetchStage = null;
+        k.preparing = false;
+        k.ready = true;
+        prefetching = null;
+        prefetchCancel = false;
+        Debug.Log($"VR180Viewer [kept]: {name} prepared out of sight: decoded in {decodeSeconds:F2}s, built in {buildMs:F0} ms" +
+                  (k.left != null ? $", layers written in {writeSeconds:F2}s" : "") +
+                  $", {Time.realtimeSinceStartup - tQuiet:F2}s in all{VR180StereoEquirectHandler.MemoryNote()}{stripNote}");
+    }
+
+    // Builds a kept photo's textures and layer images with the usual code, by standing it in as the current
+    // photo for a moment: swapped in, built, swapped back, all within this frame, so nothing else sees it
+    // layers: the layers' eye textures (not yet given to the layers: Prefetch does that with SetImage, later);
+    // otherwise the sphere's copy and fill maps
+    void BuildKept(Kept k, Texture src, PhotoInfo info, VR180Adjustments.Values adj, bool layers)
+    {
+        float savedZoom = zoom;
+        zoom = 1f;   // a kept photo never has a telephoto zoom baked into its layers
+        SwapWithCurrent(k);
+        try
+        {
+            currentInfo = info;
+            adjust = adj;
+            bool layerWanted = photoLayer != null && layerTextures != null && extractMaterial != null;
+            if (layers)
+            {
+                deferLayerImages = true;
+                if (layerWanted) BuildLayerTextures(src);
+            }
+            else
+            {
+                current = MakeMipmapped(src, layerWanted ? sphereHalvingsWithLayer : 0, info.fisheye, info.raw);
+                BakeFillMaps();
+            }
+        }
+        finally
+        {
+            deferLayerImages = false;
+            SwapWithCurrent(k);
+            zoom = savedZoom;
+        }
+    }
+
+    // Whether a kept photo can still be shown as it is; lets it go if not
+    bool KeptStillGood(Kept k)
+    {
+        var now = VR180Adjustments.Get(k.path);
+        string why = null;
+        if (!VR180Adjustments.Values.SameImage(now, k.adjust) || now.keepTilt != k.adjust.keepTilt) why = "its adjustments have changed";
+        else if (k.sphere == null) why = "it has no picture";
+        else if (k.left != null && !CanKeepLayers) why = "layers can't be kept just now";
+        else if (k.left != null && !(VR180StereoEquirectHandler.HasImage(k.left) && VR180StereoEquirectHandler.HasImage(k.right)))
+            why = "its layers lost the photo";
+        if (why == null) { k.adjust = now; return true; }   // (convergence may follow a new default)
+        Evict(k, why);
+        return false;
+    }
+
+    // Shows a kept photo. With the sharp layer on view (the Quest), a crossfade between the two pairs of
+    // layers: whichever pair is on top fades (in, or out), the other stays at full strength underneath, so
+    // it's a true crossfade either way. Otherwise (PC, layer off, or the old one not on view), a quick blur
+    // through on the sphere. The photo being left takes the kept one's place.
+    IEnumerator SwitchToKept(Kept k, float tPush)
+    {
+        if (prefetching != null) yield return CancelPrefetch();   // preparing some other photo, no longer wanted
+        string name = Path.GetFileName(k.path);
+        // (Diagnostic, 19 November: set VR180StereoEquirectHandler.TraceFrames = 15 here to log, frame by frame,
+        // every photo layer the headset is given as a switch starts.)
+        bool oldShowing = useLayer && keptWithLayers && CanKeepLayers && !PanelOpen && !layerFading &&
+                          photoLayer.gameObject.activeSelf &&
+                          VR180StereoEquirectHandler.IsVisible(photoLayer) && VR180StereoEquirectHandler.IsVisible(photoLayerRight);
+        if (layerFading) EndLayerFade();
+        ResetZoom();
+        float third = quickSwitchSeconds / 3f;
+
+        if (!oldShowing)
+        {
+            HideLayer();
+            if (!blurTransition) { if (viewerMaterial.GetFloat(FadeId) > 0.5f) yield return Fade(0f); }
+            else if (current != null && viewerMaterial.GetFloat(HoldMixId) < 0.5f)
+            {
+                if (third > 0f) yield return Animate(BlurId, 1f, third);
+                viewerMaterial.SetFloat(BlurId, 1f);
+                Graphics.CopyTexture(current, 0, current.mipmapCount - 1, holdTex, 0, 0);
+                viewerMaterial.SetFloat(HoldMixId, 1f);
+            }
+        }
+
+        // The kept photo becomes the current one; the one being left takes its place in k
+        CompositionLayer oldL = photoLayer, oldR = photoLayerRight;
+        previousPath = currentPath;
+        SwapWithCurrent(k);
+
+        bool crossfaded = false;
+        if (oldShowing)
+        {
+            bool fade = VR180StereoEquirectHandler.ColourScaleSupported && quickSwitchSeconds > 0f;
+            // The incoming pair should start underneath (one appearing on top showed a black frame at the push),
+            // so if it would be on top, the outgoing pair is raised above every photo layer. (Unity sorts layers
+            // by their Order; orders only ever go up, by 2 at most per switch.)
+            // The incoming pair goes on top, fading in from 0; the outgoing pair is never reordered and keeps its
+            // place in the list of layers. (19 November: whenever a pair was put underneath the one on view, or the
+            // one on view was raised, the headset dropped the one on view for a frame, apparently because its
+            // position in the list changed: black, or the sphere showing through.)
+            PutAboveAll(photoLayer, photoLayerRight, "the incoming pair, while still switched off");
+            bool newOnTop = photoLayer.Order > oldL.Order;   // true unless the change was refused
+            // The sphere follows the current photo's orientation (its levelling turn) from now on, while the old
+            // photo's layer still covers it at the old one's; in layer mode the sphere is black where the photo is,
+            // so where the two differ black showed through at the push (at the edges of view, or a diagonal band
+            // when the two photos' roll differs). So for the crossfade the sphere shows the new photo in full.
+            ApplySphere();
+            viewerMaterial.SetFloat(LayerModeId, 0f);
+            // Both start from how things are now: the new pair invisible (on top or underneath)
+            SetPairAlpha(photoLayer, photoLayerRight, fade ? 0f : 1f);
+            VR180StereoEquirectHandler.SetHeld(photoLayer, false);
+            VR180StereoEquirectHandler.SetHeld(photoLayerRight, false);
+            UpdateLayerPose();
+            photoLayer.gameObject.SetActive(true);
+            photoLayerRight.gameObject.SetActive(true);
+            float tv = Time.realtimeSinceStartup;
+            while (!(VR180StereoEquirectHandler.IsVisible(photoLayer) && VR180StereoEquirectHandler.IsVisible(photoLayerRight)) &&
+                   Time.realtimeSinceStartup - tv < 2f)
+                yield return null;
+            crossfaded = VR180StereoEquirectHandler.IsVisible(photoLayer) && VR180StereoEquirectHandler.IsVisible(photoLayerRight);
+            if (crossfaded && fade)
+            {
+                // The pair on top makes the crossfade; the one underneath only shows through the top one's
+                // feathered edge, so it fades too, briefly, while it's covered: before the main fade if it's the
+                // new one, after it if it's the old one. (Switching it at once flickered at the edges of view.)
+                float edge = Mathf.Min(0.15f, quickSwitchSeconds * 0.5f);
+                if (newOnTop)
+                {
+                    yield return FadePair(photoLayer, photoLayerRight, 0f, 1f, quickSwitchSeconds, false);
+                    yield return FadePair(oldL, oldR, 1f, 0f, edge, false);
+                }
+                else
+                {
+                    yield return FadePair(photoLayer, photoLayerRight, 0f, 1f, edge, false);
+                    yield return FadePair(oldL, oldR, 1f, 0f, quickSwitchSeconds, false);
+                }
+            }
+            ApplySphere();
+            oldL.gameObject.SetActive(false);
+            oldR.gameObject.SetActive(false);
+            SetPairAlpha(oldL, oldR, 1f);
+            SetPairAlpha(photoLayer, photoLayerRight, 1f);
+            if (crossfaded) StartCoroutine(EnterLayerModeWhenVisible(photoGeneration));   // the sphere back to the surround only
+            if (!crossfaded)
+            {
+                Debug.LogWarning("VR180Viewer [kept]: the kept photo's layers didn't appear within 2 s; the sphere shows it meanwhile");
+                viewerMaterial.SetFloat(LayerModeId, 0f);
+                StartCoroutine(EnterLayerModeWhenVisible(photoGeneration));
+            }
+        }
+        else
+        {
+            ApplySphere();
+            if (!viewingFavourites && VR180Favourites.IsFavourite(currentPath)) badge.Corner();
+            ShowTiltHint(Mathf.Max(0.5f, 2f * third));
+            if (!blurTransition) yield return Fade(1f);
+            else
+            {
+                viewerMaterial.SetFloat(BlurId, 1f);
+                if (third > 0f) yield return Animate(HoldMixId, 0f, third);
+                viewerMaterial.SetFloat(HoldMixId, 0f);
+                if (third > 0f) yield return Animate(BlurId, 0f, third);
+                viewerMaterial.SetFloat(BlurId, 0f);
+            }
+            if (useLayer && LayerReady && !PanelOpen) ShowLayer();
+        }
+
+        // Keep the photo just left, if it's complete (k now holds it)
+        string keepWhy = null;
+        if (!keepPrevious || keepLevel < 2) keepWhy = "";
+        else if (k.path == null || k.sphere == null) keepWhy = "";
+        else if (k.bakeZoom != 1f) keepWhy = "it had a telephoto zoom baked into its layers";
+        else if (k.left != null && (k.eyeL != null || !VR180StereoEquirectHandler.HasImage(k.left) || !VR180StereoEquirectHandler.HasImage(k.right)))
+            keepWhy = "its layers weren't fully written yet";
+        if (keepWhy == null) k.ready = true;
+        else Evict(k, keepWhy.Length > 0 ? keepWhy : "not keeping the previous photo");
+
+        Debug.Log($"VR180Viewer [kept]: {name} shown {Time.realtimeSinceStartup - tPush:F2}s after the push " +
+                  $"({(oldShowing ? (crossfaded ? $"{quickSwitchSeconds:F2}s crossfade of the layers" : "layers late") : "quick blur on the sphere")}, no decode)" +
+                  VR180StereoEquirectHandler.MemoryNote());
+        busy = false;
+        VR180Thumbnails.FromViewed(currentPath, current, currentInfo.coverage, currentInfo.sideBySide, PhotoTilt);
+        PlanKept();
+    }
+
+    // The system is short of memory: keep fewer photos for the rest of the session
+    void OnLowMemory()
+    {
+        Debug.LogWarning("VR180Viewer: the system says memory is running low" + VR180StereoEquirectHandler.MemoryNote());
+        if (kept.Count == 0 || keepLevel == 0) return;
+        keepLevel--;
+        string ahead = keepLevel >= 1 && preloadNext ? AheadPath() : null;
+        foreach (var k in kept)
+            if (k.path != null && (keepLevel == 0 || !Same(k.path, ahead))) Evict(k, "memory is low");
+        Debug.LogWarning("VR180Viewer [kept]: memory is low, so for the rest of this session " +
+                         (keepLevel == 1 ? "the previous photo isn't kept (the next is still prepared)" : "no photos are kept or prepared"));
     }
 
     void ShowTiltHint(float seconds)
@@ -1654,9 +2541,7 @@ public class VR180Viewer : MonoBehaviour
             Graphics.Blit(current, fillMaps[eye], fillBakeMaterial);
             fillMaps[eye].GenerateMips();
         }
-        viewerMaterial.SetTexture(FillMap0Id, fillMaps[0]);
-        viewerMaterial.SetTexture(FillMap1Id, fillMaps[1]);
-        viewerMaterial.SetFloat(FillMapSizeId, FillMapSize);
+        // (ApplySphere gives them to the sphere's material)
     }
 
     // ------------------------------------------------------------------ compositor layer
@@ -1724,7 +2609,7 @@ public class VR180Viewer : MonoBehaviour
 
         // With our own handler, the headset's swapchains are written once from these textures,
         // after which they can be freed (see ReleaseWhenResident)
-        if (StereoLayers)
+        if (StereoLayers && !deferLayerImages)
         {
             VR180StereoEquirectHandler.SetImage(photoLayer, layerLeft);
             VR180StereoEquirectHandler.SetImage(photoLayerRight, layerRight);
@@ -1836,9 +2721,14 @@ public class VR180Viewer : MonoBehaviour
         Destroy(t);
     }
 
-    void ShowLayer()
+    // fadeIn: start invisible; FadeLayerIn brings it up (Show only). Otherwise it appears at full strength.
+    void ShowLayer(bool fadeIn = false)
     {
         if (!LayerReady) return;
+        layerFading = fadeIn;
+        SetPairAlpha(photoLayer, photoLayerRight, fadeIn ? 0f : 1f);
+        VR180StereoEquirectHandler.SetHeld(photoLayer, false);
+        VR180StereoEquirectHandler.SetHeld(photoLayerRight, false);
         UpdateLayerPose();
         photoLayer.gameObject.SetActive(true);
         if (StereoLayers) photoLayerRight.gameObject.SetActive(true);
@@ -1857,6 +2747,37 @@ public class VR180Viewer : MonoBehaviour
         }
     }
 
+    // Fades the sharp layer in over the sphere (layerFadeSeconds), once the headset holds the photo.
+    // The layers' colour scale does the fading (VR180StereoEquirectHandler.SetAlpha).
+    IEnumerator FadeLayerIn(int generation)
+    {
+        float t0 = Time.realtimeSinceStartup;
+        while (!(VR180StereoEquirectHandler.IsVisible(photoLayer) && VR180StereoEquirectHandler.IsVisible(photoLayerRight)))
+        {
+            if (generation != photoGeneration) yield break;   // a new photo has taken over (it resets the alpha)
+            if (!StillFading() || Time.realtimeSinceStartup - t0 > 10f) { EndLayerFade(); yield break; }
+            yield return null;
+        }
+        float waited = Time.realtimeSinceStartup - t0;
+        for (float t = 0f; t < layerFadeSeconds; t += Time.deltaTime)
+        {
+            if (generation != photoGeneration) yield break;
+            if (!StillFading()) { EndLayerFade(); yield break; }
+            SetPairAlpha(photoLayer, photoLayerRight, Mathf.SmoothStep(0f, 1f, t / layerFadeSeconds));
+            yield return null;
+        }
+        EndLayerFade();
+        Debug.Log($"VR180Viewer [layer]: faded in over {layerFadeSeconds:F2}s, after waiting {waited:F2}s for the headset to hold the photo");
+    }
+
+    bool StillFading() => layerFading && useLayer && photoLayer != null && photoLayer.gameObject.activeSelf;
+
+    void EndLayerFade()
+    {
+        layerFading = false;
+        SetPairAlpha(photoLayer, photoLayerRight, 1f);
+    }
+
     IEnumerator EnterLayerModeWhenVisible(int generation)
     {
         float t0 = Time.realtimeSinceStartup;
@@ -1871,6 +2792,12 @@ public class VR180Viewer : MonoBehaviour
             yield return null;
         }
         yield return null;   // let the layer's first frame reach the headset before the sphere steps aside
+        // Fading in: the sphere keeps drawing the photo underneath until the layer is fully opaque
+        while (layerFading)
+        {
+            if (generation != photoGeneration || !useLayer || !photoLayer.gameObject.activeSelf) yield break;
+            yield return null;
+        }
         if (generation == photoGeneration && useLayer && photoLayer.gameObject.activeSelf)
         {
             viewerMaterial.SetFloat(LayerModeId, 1f);
@@ -1916,6 +2843,15 @@ public class VR180Viewer : MonoBehaviour
         Debug.Log("VR180Viewer [layer]: nudged");
     }
 
+    // Single-image swapchains can't be rewritten, so the next photo needs new ones anyway; freeing the old
+    // pair early keeps memory down while it decodes. The handler only frees a layer hidden for a few frames.
+    void DiscardLayerSwapchains()
+    {
+        if (!StereoLayers) return;
+        VR180StereoEquirectHandler.DiscardSwapchain(photoLayer);
+        VR180StereoEquirectHandler.DiscardSwapchain(photoLayerRight);
+    }
+
     void HideLayer()
     {
         if (photoLayer != null) photoLayer.gameObject.SetActive(false);
@@ -1939,6 +2875,7 @@ public class VR180Viewer : MonoBehaviour
         VR180StereoEquirectHandler.SetZoom(photoLayerRight, zoomed, crop, central, upper, lower);
         bool filter = layerFilterOn && (layerFilterFromZoom <= 0f || zoom > layerFilterFromZoom + 1e-4f);
         VR180StereoEquirectHandler.SettingsFlags = filter ? LayerFilterFlags(layerFilter) : 0;
+        VR180StereoEquirectHandler.FadeScalesColour = layerFadeScalesColour;
         Quaternion rot = Display * Quaternion.Euler(0f, centreLon, 0f);
         // Convergence: turn the left eye's image right and the right eye's left by half each
         // (positive = crossed = nearer), matching the sphere shader. Only with one layer per eye.

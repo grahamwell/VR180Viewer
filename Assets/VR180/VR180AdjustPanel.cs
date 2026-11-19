@@ -43,6 +43,8 @@ public class VR180AdjustPanel : MonoBehaviour
     TextMeshProUGUI rollText;
     Slider parallax;
     TextMeshProUGUI parallaxText;
+    Slider quickSwitch;
+    TextMeshProUGUI quickSwitchText;
     bool updating;   // true while the sliders are being set from code
 
     public bool IsOpen => canvas != null && canvas.gameObject.activeSelf;
@@ -56,7 +58,7 @@ public class VR180AdjustPanel : MonoBehaviour
 
     /// tilt: a description of the camera's tilt for a raw photo whose levelling can be switched off, else null
     public void Open(Transform head, string photoName, VR180Adjustments.Values v, float bias, bool isFavourite, float rollStrength,
-                     float parallaxMetres, string tilt = null)
+                     float parallaxMetres, float quickSwitchSeconds, string tilt = null)
     {
         titleText.text = photoName;
         levelShown = tilt != null;
@@ -65,6 +67,7 @@ public class VR180AdjustPanel : MonoBehaviour
         if (levelShown) levelText.text = $"Level the horizon  ({tilt})";
         roll.SetValueWithoutNotify(rollStrength);
         parallax.SetValueWithoutNotify(ParallaxToSlider(parallaxMetres));
+        quickSwitch.SetValueWithoutNotify(quickSwitchSeconds);
         SetSliders(v, bias);
         favourite.SetIsOnWithoutNotify(isFavourite);
         PlaceInFrontOf(head);
@@ -139,6 +142,7 @@ public class VR180AdjustPanel : MonoBehaviour
         parallaxText.text = m > 0f
             ? $"Head-turn parallax   {m:0.0} m"
             : "Head-turn parallax   off";
+        quickSwitchText.text = $"Quick switch   {quickSwitch.value:0.00} s";
     }
 
     static float SliderToParallax(float s) =>
@@ -219,8 +223,11 @@ public class VR180AdjustPanel : MonoBehaviour
         roll.onValueChanged.AddListener(v => { if (!updating) viewer.SetRollCompensation(v); });
         parallax   = AddSetting(right, 0f, 1f, out parallaxText);
         parallax.onValueChanged.AddListener(v => { if (!updating) viewer.SetParallaxDistance(SliderToParallax(v)); });
+        quickSwitch = AddSetting(right, VR180Viewer.QuickSwitchMin, VR180Viewer.QuickSwitchMax, out quickSwitchText);
+        quickSwitch.onValueChanged.AddListener(v => { if (!updating) viewer.SetQuickSwitchSeconds(v); });
         AddNote(right, "Sharpness affects the PC view and this preview only. Roll compensation acts only when looking " +
-                       "down and to the side. Head-turn parallax: things at this distance stay put as you turn your head.");
+                       "down and to the side. Head-turn parallax: things at this distance stay put as you turn your head. " +
+                       "Quick switch: the crossfade to a photo that was made ready while you looked at the last one.");
 
         Spacer(bg, 10);
         var buttons = NewUI("Buttons", bg);

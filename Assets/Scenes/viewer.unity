@@ -532,10 +532,12 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::VR180Viewer
   viewerMaterial: {fileID: 2100000, guid: 20714a6590b6d444ba81e283430fe8a8, type: 2}
   sphereRadius: 50
+  hideControllers: 1
   photoLayer: {fileID: 165382160}
   photoLayerRight: {fileID: 1068868245}
   eyeExtractShader: {fileID: 4800000, guid: 37a6b0bf95b83aa4480ee00c7545a504, type: 3}
   useLayer: 1
+  singleImageSwapchains: 1
   layerOnPC: 0
   pcRenderScale: 2
   layerRadius: 50
@@ -564,6 +566,7 @@ MonoBehaviour:
   zoomCropFlipY: 0
   zoomVerticalFollow: 0
   zoomStyle: 1
+  zoomSettleSeconds: 0.5
   tiltHintDegrees: 15
   layerFilter: 2
   layerFilterFromZoom: 1
@@ -575,10 +578,17 @@ MonoBehaviour:
   flipThumbnails: 0
   stereoThumbnails: 1
   thumbnailDepth: 0.015
+  keepPrevious: 1
+  preloadNext: 1
+  keepPhotosOnPC: 1
+  quickSwitchSeconds: 2
+  warmUpPreparedLayers: 0
   blurTransition: 1
   blurOutSeconds: 0.25
   colourBlendSeconds: 0.4
   blurInSeconds: 0.25
+  layerFadeSeconds: 0.25
+  layerFadeScalesColour: 0
   fadeSeconds: 0.25
 --- !u!1 &1068868242
 GameObject:
@@ -813,7 +823,7 @@ GameObject:
   m_IsActive: 1
 --- !u!114 &2098994341
 MonoBehaviour:
-  m_ObjectHideFlags: 2
+  m_ObjectHideFlags: 49
   m_CorrespondingSourceObject: {fileID: 0}
   m_PrefabInstance: {fileID: 0}
   m_PrefabAsset: {fileID: 0}

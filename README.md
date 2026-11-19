@@ -13,13 +13,15 @@ With a QooCam 3 Ultra modified for VR180 (lenses side by side), it can also **im
 - **Maximum sharpness:** each eye shown at full source resolution through its own compositor layer.
 - **Soft dead zone:** outside the 180° image, a mirrored, progressively blurred fill instead of a hard black edge, with no "vortex" when you look straight up or down.
 - **Gentle transitions:** the old photo melts to its average colour and the new one sharpens in, with no flash to black.
+- **Quick switching:** while you look at a photo, the next one (in the direction you're going) is prepared out of sight, and the one you've just left is kept, so stepping on or back is a short crossfade instead of a two-second load. The crossfade's length is adjustable (Quick switch, 0.25 to 2 s).
 - **Thumbnail picker:** a scrolling grid of stereo thumbnails (they show in 3D in the headset), folder tiles with a cover photo and photo counts, and the current photo highlighted. Thumbnails are made in the background the first time you open a folder and kept for next time.
 - **Zoom (0.5× to 2×)** with either thumbstick. Zooming in uses a telephoto-style projection, so straight lines stay straight and the horizon stays level, wherever you zoom. On the Quest the zoomed view is re-made at full sharpness a moment after you let go of the stick.
 - **Tilted photos:** photos taken pointing up or down are shown level, using the camera's own tilt sensor, with nothing cut off. A brief arrow points to the photo's centre when it loads if it is well above or below where you are looking. Levelling can be switched off for any one photo.
-- **Image adjustments** per photo: brightness, contrast, saturation, convergence; plus global sharpness, roll compensation and head-turn parallax.
+- **Image adjustments** per photo: brightness, contrast, saturation, convergence; plus global sharpness, roll compensation, head-turn parallax and the quick-switch crossfade.
 - **Favourites:** mark photos with the trigger, view all favourites (in name order or shuffled; a shuffle carries on where it left off next time), tidy a folder by deleting its non-favourites, and (on PC) copy favourites to a folder ready to transfer to the Quest.
+- **Mark and delete:** in the picker, hold the grip and sweep the ray over photos to mark them (in any folders), then delete them all at once after a confirmation page.
 - **Flat 2D export:** frame part of the photo with a 16:9 guide and save it as an ordinary JPEG to share with people who don't have a headset.
-- **One-handed use:** everything except flat export works with the right controller alone.
+- **One-handed use:** everything except flat export works with the right controller alone. The controllers and their rays are hidden while you look at a photo and appear when a panel is open.
 - **Roll compensation:** when you look down and to the side, the stereo pair turns with your head to reduce vertical mismatch (adjustable, 0 to 100%; 70% by default).
 - **Head-turn parallax (experimental, off by default):** a small amount of parallax as you turn your head, as if the scene were at a set distance.
 - **Stays put:** photos keep the same position as you step through them; hold the Quest button (or the right thumbstick click) to recentre. The view recovers by itself after the headset sleeps.
@@ -29,7 +31,7 @@ With a QooCam 3 Ultra modified for VR180 (lenses side by side), it can also **im
 
 ## Requirements
 
-- Meta Quest 3 (other Quest models are untested; the two full-resolution layers use about 1.1 GB of memory).
+- Meta Quest 3 (other Quest models are untested; each photo's pair of full-resolution layers uses about 0.4 GB of memory, and up to three photos are kept ready).
 - Developer Mode enabled on the headset, to install an APK.
 - VR180 photos as **side-by-side equirectangular JPEGs**. GPano (Google Photo Sphere) metadata is read if present; without it, a JPEG is assumed to be 180° × 180° side-by-side. Developed with QooCam 3 Ultra stills (13,888 × 6,944).
 - Or **unprocessed QooCam 3 Ultra JPEGs** (two fisheye circles side by side) from a camera modified for VR180, with its calibration file (see below).
@@ -63,6 +65,7 @@ Flat exports are saved to *Pictures/VR180 Flat*.
 | Right **A** | Open or close the picker (also has the Exit button) |
 | Right **B** | Open or close the adjustments panel |
 | Right trigger | Mark or unmark a favourite (select and drag in the picker and panel) |
+| Hold grip and point (picker) | Mark photos for deleting: the photos the ray passes over are marked, or unmarked if you start on a marked one |
 | Hold right thumbstick click, or hold the Quest button | Recentre the view |
 | Left trigger | Flat export: enter framing mode, then press again to save |
 | Left thumbstick (framing) | Zoom the framing guide |
@@ -70,11 +73,11 @@ Flat exports are saved to *Pictures/VR180 Flat*.
 
 A favourite is confirmed with a sound and a buzz on the right controller: a rising chime when added, a falling one when removed.
 
-In the Unity Editor: arrow keys to step through photos, M for the picker, A for the adjustments panel, space to mark a favourite, F for flat export, T to switch zoom style.
+In the Unity Editor: arrow keys to step through photos, M for the picker, A for the adjustments panel, space to mark a favourite, F for flat export, T to switch zoom style, hold G and point with the mouse to mark photos in the picker.
 
 Per-photo adjustments, favourites and thumbnails are stored inside the app's own data folder, so uninstalling the app erases them.
 
-> **Careful:** "Tidy" in the picker permanently deletes the non-favourite photos in that folder (after a confirmation page).
+> **Careful:** "Tidy" in the picker permanently deletes the non-favourite photos in that folder, and "Delete N marked photos" deletes the photos you've marked (both after a confirmation page). There is no recycle bin on the Quest.
 
 ## Importing from a QooCam 3 Ultra (modified for VR180)
 
@@ -125,16 +128,20 @@ It's worth setting your own package name (*Project Settings › Player › Andro
 
 ### Package versions matter
 
-`Packages/packages-lock.json` pins the exact versions the viewer was developed with, notably **OpenXR 1.16.1** and **XR Composition Layers 2.6.1**. The custom layer handler works around bugs in those versions, so please don't upgrade them casually. If you do, read the notes below first.
+`Packages/packages-lock.json` pins the exact versions the viewer was developed with, notably **OpenXR 1.19.0** and **XR Composition Layers 2.6.1**. The custom layer handler and the swapchain feature depend on how those versions work inside, so please don't upgrade them casually. If you do, read the notes below first.
+
+Two of the viewer's own OpenXR features must be ticked in *Project Settings › XR Plug-in Management › OpenXR*, Android tab: **VR180 Single-Image Swapchains** and **VR180 Layer Sharpening (experiment)**. They are saved ticked with the project; without the first, the viewer falls back to ordinary three-image swapchains (about 0.75 GB more memory per photo).
 
 ## How it works
 
-The code is all in `Assets/VR180`, apart from two small Java plugins in `Assets/Plugins/Android`.
+The code is all in `Assets/VR180`, apart from three small Java plugins in `Assets/Plugins/Android`.
 
 | File | Purpose |
 |---|---|
 | `VR180Viewer.cs` | Main controller: lists and decodes photos, reads metadata, extracts each eye, drives the two compositor layers, zoom, transitions and input. |
 | `VR180StereoEquirectHandler.cs` | Replaces Unity's OpenXR equirect layer handler on the Quest (when `XR_KHR_composition_layer_equirect2` is available). |
+| `VR180StaticSwapchainFeature.cs` | OpenXR feature that lets each layer use a single-image (static) swapchain, written once per photo. |
+| `VR180StripDecoder.cs`, `Plugins/Android/StripDecoder.java` | On the Quest, decodes the photo being prepared on its own thread and uploads it to the GPU a strip at a time, so viewing doesn't judder. |
 | `VR180LayerSettingsFeature.cs` | OpenXR feature that enables `XR_FB_composition_layer_settings` (compositor sharpening while zoomed). |
 | `VR180StereoEquirect.shader` | The head-following sphere: preview, dead-zone fill, zoom and transitions. |
 | `VR180EyeExtract.shader` | Copies one eye at one source pixel per output pixel, with a feathered edge, baked-in adjustments and (when zoomed) the telephoto zoom. |
@@ -154,14 +161,15 @@ The code is all in `Assets/VR180`, apart from two small Java plugins in `Assets/
 
 Notes for developers, found the hard way:
 
-- **Two layers, not one.** OpenXR 1.16.1's equirect handler sends the left texture to both eyes (per-eye targeting arrives in 1.18), so the viewer uses one layer per eye with its own handler.
-- **Lower vertical angle.** Composition Layers 2.6 measures it from the equator, but OpenXR 1.16.1 negates it, giving a zero-height band. The custom handler passes angles through unchanged.
-- **Write-once swapchains.** Unity's handler copies the source into the swapchain every frame; this one writes each swapchain image once and then frees the eye textures (about 380 MB saved). After the headset sleeps the swapchains are lost, so the viewer re-decodes the photo.
+- **Our own layer handler.** The viewer uses one equirect layer per eye with its own handler. (It was first written because OpenXR 1.16.1 sent the left texture to both eyes and negated the lower vertical angle; 1.19 fixes both, but the handler is still needed for the zoom crop, the colour-scale fades and the write-once single-image swapchains.)
+- **Single-image swapchains.** Each layer's swapchain holds one image, written once per photo, after which the eye textures are freed (about 0.4 GB per photo instead of 1.16 GB). Unity acquires and releases every new layer swapchain once as soon as it creates it, which uses up a static swapchain's only acquire, so `VR180StaticSwapchainFeature` hooks the OpenXR swapchain calls (in C#, no native plugin) and answers that empty round trip itself. After the headset sleeps the swapchains are lost, so the viewer re-decodes the photo.
+- **Layer order on the Quest.** Never put a layer underneath one that's on view, or change the order of a layer on view: the compositor drops the visible layer for a frame (a black flicker). New layers go on top; the crossfades are built that way.
+- **Upload in strips.** Unity's JPEG decode uploads the whole 385 MB photo in one frame (about 200 ms on the Quest 3). The photo being prepared in the background is decoded by Android instead and uploaded in about 55 strips, under 1 ms a frame.
 - **Quest Link** has no `equirect2`, so on PC the layer is off and the photo is shown on the sphere at full resolution instead.
 - **Levelling by turning, not resampling.** A tilted photo is extracted in the camera's own frame and the sphere and layers are turned to level it, so nothing beyond 90° from the horizon is lost.
 - **Telephoto zoom on the Quest.** An equirect layer can only scale longitude and latitude, which bends the horizon when zoomed off-centre. So while zooming the layer steps aside (the softer sphere shows the zoom), and once the stick has been released for half a second the eye images are re-made with the zoom baked in (about 2.5 s).
 
-If you move to OpenXR 1.18 or later, these workarounds may become unnecessary or wrong. Try it in a copy of the project.
+If you move to a newer OpenXR package, check these workarounds still hold. Try it in a copy of the project.
 
 ## Known limitations
 

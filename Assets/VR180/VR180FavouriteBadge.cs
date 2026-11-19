@@ -98,6 +98,9 @@ public class VR180FavouriteBadge : MonoBehaviour
         Pulse(0.4f, 0.05f);
     }
 
+    /// A light tap on the right controller (marking a photo in the picker)
+    public static void Tap() => Pulse(0.25f, 0.03f);
+
     // OpenXR haptics go through an action bound to the controller's haptic output
     static InputAction s_Haptic;
 

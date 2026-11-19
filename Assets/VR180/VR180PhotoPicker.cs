@@ -32,6 +32,7 @@ using System.Threading.Tasks;
 using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
 using UnityEngine.UI;
 using UnityEngine.XR.Interaction.Toolkit.UI;
 
@@ -61,6 +62,17 @@ public class VR180PhotoPicker : MonoBehaviour
     readonly List<GameObject> rows = new List<GameObject>();       // the list (confirmations etc.)
     readonly List<GameObject> sideRows = new List<GameObject>();
     List<string> tidyList;   // photos waiting for the delete confirmation, or null
+    List<string> deleteList; // marked photos waiting for the delete confirmation, or null
+
+    // Marked photos, for deleting (any folder, this session only). Hold grip and point: the photos the ray
+    // passes over are marked, or unmarked if the sweep started on a marked one.
+    readonly HashSet<string> marked = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    InputAction markAction;
+    string hoveredPhoto;        // the photo tile under a ray, or null
+    string lastPainted;         // the last photo this grip hold changed (or found already right)
+    bool? paintMarks;           // this grip hold: marking (true) or unmarking (false); null until the first photo
+    List<string> photosShown = new List<string>();   // the folder's photos, as last listed
+    static readonly Color MarkColour = new Color(0.95f, 0.30f, 0.26f);
     List<string> copyList;   // favourites waiting for the copy confirmation, or null (PC only)
     bool copying;
     int copyDone, copyTotal;
@@ -97,6 +109,8 @@ public class VR180PhotoPicker : MonoBehaviour
         public bool hasThumb;           // a current thumbnail exists on disk
         public Texture2D tex;           // loaded while near the visible part of the grid
         public int row;
+        public string photo;            // photo tiles: the photo's path
+        public GameObject markOutline, markTint;
     }
     readonly List<Tile> tiles = new List<Tile>();
     float scroll, maxScroll;            // units scrolled down from the top
@@ -119,6 +133,12 @@ public class VR180PhotoPicker : MonoBehaviour
         canvas.gameObject.SetActive(false);
         VR180Thumbnails.Ready += OnThumbnailReady;
 
+        markAction = new InputAction("MarkPhotos", InputActionType.Button);
+        markAction.AddBinding("<XRController>{RightHand}/{GripButton}");
+        markAction.AddBinding("<XRController>{LeftHand}/{GripButton}");
+        markAction.AddBinding("<Keyboard>/g");   // Editor: hold G and point with the mouse
+        markAction.Enable();
+
         if (FindFirstObjectByType<XRUIInputModule>() == null)
             Debug.LogWarning("VR180Viewer [picker]: no XR UI Input Module in the scene's EventSystem, so the controller rays can't click the picker.");
     }
@@ -129,6 +149,7 @@ public class VR180PhotoPicker : MonoBehaviour
         folder = startFolder != null && IsUnderRoot(startFolder) && Directory.Exists(startFolder) ? Path.GetFullPath(startFolder) : root;
         highlightPath = currentPhoto;
         tidyList = null;
+        deleteList = null;
         copyList = null;
         infoCache.Clear();   // photos may have been copied in since last time
         PlaceInFrontOf(head);
@@ -150,6 +171,7 @@ public class VR180PhotoPicker : MonoBehaviour
     void OnDestroy()
     {
         VR180Thumbnails.Ready -= OnThumbnailReady;
+        markAction?.Dispose();
         ClearTiles();
         foreach (var m in roundMaterials.Values) if (m != null) Destroy(m);
         if (starTexture != null) Destroy(starTexture);
@@ -205,11 +227,14 @@ public class VR180PhotoPicker : MonoBehaviour
         if (copying) { ShowCopyProgress(); return; }
         if (importStage != ImportStage.None) { ShowImport(); return; }
         if (tidyList != null) { ShowTidyConfirmation(); return; }
+        if (deleteList != null) { ShowDeleteConfirmation(); return; }
         if (copyList != null) { ShowCopyConfirmation(); return; }
 
         titleText.text = DisplayPath(folder);
         List<string> photosHere = SortedPhotos(folder);
         VR180Thumbnails.Prune(folder, photosHere);
+        photosShown = photosHere;
+        marked.RemoveWhere(p => !File.Exists(p));   // (deleted or moved meanwhile)
 
         BuildSide(photosHere);
         BuildGrid(photosHere, opening);
@@ -232,6 +257,8 @@ public class VR180PhotoPicker : MonoBehaviour
         int missing = tiles.Count(t => t.thumbOf != null && !t.hasThumb);
         string s = string.Join(", ", parts);
         if (missing > 0) s += $"   (making thumbnails: {missing} to go)";
+        if (marked.Count > 0) s += $"   \u00b7   {marked.Count} marked";
+        else if (photos > 0) s += "   \u00b7   hold grip and point to mark photos";
         return s;
     }
 
@@ -278,6 +305,52 @@ public class VR180PhotoPicker : MonoBehaviour
             AddSideRow($"Tidy: delete {others} non-favourite{(others == 1 ? "" : "s")}", () => { tidyList = doomed; Refresh(); }, false,
                        $"{SizeText(TotalBytes(doomed))}; the {favHere} {(favHere == 1 ? "favourite stays" : "favourites stay")}");
         }
+
+        // Marked photos (from any folder)
+        if (marked.Count > 0)
+        {
+            int n = marked.Count;
+            int markedHere = photosHere.Count(p => marked.Contains(p));
+            string where = markedHere == n ? (n == 1 ? "in this folder" : "all in this folder")
+                         : markedHere == 0 ? "none in this folder" : $"{markedHere} in this folder";
+            AddSideRow($"Delete {n} marked photo{(n == 1 ? "" : "s")}",
+                       () => { deleteList = marked.OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList(); Refresh(); }, false,
+                       $"{SizeText(TotalBytes(marked))}, {where}");
+            Tint(sideRows[sideRows.Count - 1], DangerColour);
+            AddSideRow("Clear the marks", () => { marked.Clear(); UpdateMarks(); }, false, "hold grip and point to mark photos");
+        }
+    }
+
+    // ------------------------------------------------------------------ marking photos (hold grip and point)
+
+    void UpdateMarking()
+    {
+        if (markAction == null) return;
+        if (!markAction.IsPressed()) { paintMarks = null; lastPainted = null; return; }
+        if (hoveredPhoto == null || string.Equals(hoveredPhoto, lastPainted, StringComparison.OrdinalIgnoreCase)) return;
+        lastPainted = hoveredPhoto;
+        if (paintMarks == null) paintMarks = !marked.Contains(hoveredPhoto);   // the first photo decides
+        bool changed = paintMarks.Value ? marked.Add(hoveredPhoto) : marked.Remove(hoveredPhoto);
+        if (!changed) return;
+        VR180FavouriteBadge.Tap();
+        UpdateMarks();
+    }
+
+    // The tiles' marks, the side column's rows and the status line, after the marks changed
+    void UpdateMarks()
+    {
+        foreach (var t in tiles)
+            if (t.photo != null) SetMarkVisual(t, marked.Contains(t.photo));
+        foreach (var r in sideRows) Destroy(r);
+        sideRows.Clear();
+        BuildSide(photosShown);
+        if (notice == null && gridMode) statusText.text = Summary(Subfolders(folder).Length, photosShown.Count);
+    }
+
+    static void SetMarkVisual(Tile t, bool on)
+    {
+        if (t.markOutline != null) t.markOutline.SetActive(on);
+        if (t.markTint != null) t.markTint.SetActive(on);
     }
 
     void RefreshKeepingScroll() => Refresh();
@@ -346,6 +419,7 @@ public class VR180PhotoPicker : MonoBehaviour
     {
         UpdateCameraRow();
         if (!IsOpen || !gridMode) return;
+        UpdateMarking();
 
         // Load the thumbnails near the visible rows (a few per frame), free those far away
         float viewH = gridViewport.rect.height;
@@ -403,6 +477,7 @@ public class VR180PhotoPicker : MonoBehaviour
             if (t.rect != null) Destroy(t.rect.gameObject);
         }
         tiles.Clear();
+        hoveredPhoto = null;
         if (VR180Thumbnails.Instance != null) VR180Thumbnails.Instance.SetQueue(new List<string>());
     }
 
@@ -473,8 +548,18 @@ public class VR180PhotoPicker : MonoBehaviour
     {
         var tile = NewTile(i, "Photo", () => viewer.LoadFolder(folder, path));
         var lift = (RectTransform)tile.rect.Find("Lift");
+        tile.photo = path;
+        tile.markOutline = NewRounded("Marked", lift, MarkColour, ThumbArea(11f)).gameObject;   // (outside the blue outline)
         if (current) NewRounded("Current", lift, AccentColour, ThumbArea(7f));
         tile.thumb = NewRounded("Thumb", lift, TileColour * 1.3f, ThumbArea());
+        tile.markTint = NewRounded("MarkedTint", lift, new Color(0.85f, 0.12f, 0.10f, 0.38f), ThumbArea()).gameObject;
+        SetMarkVisual(tile, marked.Contains(path));
+        var hover = tile.rect.GetComponent<TileHover>();
+        hover.changed = on =>
+        {
+            if (on) hoveredPhoto = path;
+            else if (string.Equals(hoveredPhoto, path, StringComparison.OrdinalIgnoreCase)) hoveredPhoto = null;
+        };
         tile.thumbOf = path;
         tile.hasThumb = VR180Thumbnails.Has(path);
         if (VR180Favourites.IsFavourite(path)) AddStar(lift);
@@ -709,12 +794,13 @@ public class VR180PhotoPicker : MonoBehaviour
     {
         public RectTransform lift;
         public RawImage shadow;
+        public Action<bool> changed;    // photo tiles: tells the picker which photo is being pointed at
         bool over;
         float t;
 
-        public void OnPointerEnter(PointerEventData e) => over = true;
-        public void OnPointerExit(PointerEventData e) => over = false;
-        void OnDisable() { over = false; t = 0f; Apply(); }
+        public void OnPointerEnter(PointerEventData e) { over = true; changed?.Invoke(true); }
+        public void OnPointerExit(PointerEventData e) { over = false; changed?.Invoke(false); }
+        void OnDisable() { if (over) changed?.Invoke(false); over = false; t = 0f; Apply(); }
 
         void Update()
         {
@@ -751,20 +837,62 @@ public class VR180PhotoPicker : MonoBehaviour
 
     void DeleteTidyList()
     {
+        DeletePhotos(tidyList, $"tidy in {folder}");
+        tidyList = null;
+        Refresh();
+    }
+
+    // Deletes the files, and tells everything that knew about them (gallery, viewer, thumbnails, favourites, marks)
+    void DeletePhotos(List<string> paths, string what)
+    {
         var deleted = new List<string>();
         int failed = 0;
-        foreach (string p in tidyList)
+        foreach (string p in paths)
         {
             try { File.Delete(p); deleted.Add(p); }
             catch (Exception e) { failed++; Debug.LogWarning($"VR180Viewer [picker]: couldn't delete {p}: {e.Message}"); }
         }
-        Debug.Log($"VR180Viewer [picker]: tidy deleted {deleted.Count} photo(s) in {folder}{(failed > 0 ? $", {failed} failed" : "")}");
+        Debug.Log($"VR180Viewer [picker]: {what}: deleted {deleted.Count} photo(s){(failed > 0 ? $", {failed} failed" : "")}");
         ForgetInGallery(deleted);
         viewer.ForgetFiles(deleted);
         VR180Thumbnails.Forget(deleted);
-        tidyList = null;
+        VR180Favourites.Deleted(deleted, root);
+        marked.ExceptWith(deleted);
         infoCache.Clear();
         notice = $"Deleted {deleted.Count} photo{(deleted.Count == 1 ? "" : "s")}." + (failed > 0 ? $" {failed} couldn't be deleted." : "");
+    }
+
+    // ------------------------------------------------------------------ delete the marked photos
+
+    void ShowDeleteConfirmation()
+    {
+        int n = deleteList.Count;
+        string photos = $"{n} photo{(n == 1 ? "" : "s")}";
+        int favs = deleteList.Count(VR180Favourites.IsFavourite);
+        var dirs = deleteList.Select(p => Path.GetDirectoryName(p)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        bool onView = highlightPath != null && deleteList.Any(p => SamePath(p, highlightPath));
+        titleText.text = $"Delete {photos}?";
+        string text = dirs.Count == 1
+            ? $"The {(n == 1 ? "photo" : photos)} you marked in {DisplayPath(dirs[0])}."
+            : $"The {photos} you marked, in {dirs.Count} folders.";
+        if (favs > 0) text += favs == n ? (n == 1 ? " It's a favourite." : " They're all favourites.")
+                                        : $" {favs} of them {(favs == 1 ? "is a favourite" : "are favourites")}.";
+        if (onView) text += n == 1 ? " It's the photo you're looking at." : " One is the photo you're looking at.";
+        text += VR180Viewer.OnQuest
+            ? "\nDeleting can't be undone: there's no recycle bin on the Quest. Only do this if you have copies elsewhere, such as on your PC."
+            : "\nDeleting can't be undone: the files don't go to the Recycle Bin.";
+        statusText.text = text;
+        AddRow($"Delete {photos} ({SizeText(TotalBytes(deleteList))})", DeleteMarked);
+        Tint(rows[rows.Count - 1], DangerColour);
+        AddRow("Cancel (keep the marks)", () => { deleteList = null; Refresh(); }, true);
+        AddRow("Cancel and clear the marks", () => { deleteList = null; marked.Clear(); Refresh(); });
+    }
+
+    void DeleteMarked()
+    {
+        DeletePhotos(deleteList, "marked photos");
+        deleteList = null;
+        if (!Directory.Exists(folder)) folder = root;
         Refresh();
     }
 
@@ -1071,6 +1199,7 @@ public class VR180PhotoPicker : MonoBehaviour
         if (target == null || !IsUnderRoot(target)) target = root;
         folder = Path.GetFullPath(target);
         tidyList = null;
+        deleteList = null;
         copyList = null;
         Refresh();
     }

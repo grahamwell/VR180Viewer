@@ -49,6 +49,18 @@ public static class VR180Favourites
         if (any) Save();
     }
 
+    /// After photos were deleted: a deleted favourite is moved to another photo with the same name under
+    /// root if there is one (a copy in the Favourites folder, say), otherwise forgotten
+    public static void Deleted(IEnumerable<string> photoPaths, string root)
+    {
+        Load();
+        var missing = new HashSet<string>(photoPaths.Select(Key).Where(k => s_Map.ContainsKey(k) && !File.Exists(s_Map[k])));
+        if (missing.Count == 0) return;
+        if (Directory.Exists(root)) Search(root, missing, 0);
+        foreach (string k in missing) s_Map.Remove(k);
+        Save();
+    }
+
     /// Returns true if the photo is now a favourite
     public static bool Toggle(string photoPath)
     {
